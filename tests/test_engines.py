@@ -251,6 +251,16 @@ class TestStatementMatrix:
         rows = await engine.fetch_all(sa.select(AdaBook).order_by(AdaBook.id))
         assert rows == [AdaBook(id=10, title="structures"), AdaBook(id=11, title="algorithms")]
 
+    async def test_a_text_column_keeps_its_slot(self, engine):
+        """`selected_columns` leaves a bare `text()` out; the driver does not."""
+        first = sa.select(sa.text("'a'"), Author.id).where(Author.id == 1)
+        second = sa.select(sa.text("'b'"), Author.id).where(Author.id == 2)
+        assert await engine.fetch_all(first) == [("a", 1)]
+        assert await engine.fetch_all(first.union_all(second).order_by(sa.text("2"))) == [
+            ("a", 1),
+            ("b", 2),
+        ]
+
     async def test_a_subquery_joins_back_against_its_table(self, engine):
         newest = rf.alias(
             Author, of=sa.select(Author).order_by(Author.id.desc()).limit(2).subquery()
