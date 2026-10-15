@@ -13,6 +13,7 @@ from abc import ABC
 import pytest
 import sqlalchemy as sa
 from conftest import Author, Base, Book, Colour, Wide
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.sqlite import aiosqlite
 from sqlalchemy.orm import Mapped
 
@@ -301,6 +302,99 @@ class TestInstances:
 
         instance = Generated(name="x")
         assert not hasattr(instance, "id")
+
+
+class TestClassBodyReferences:
+    """A field declared with `rf.mapped_column()` is a column expression inside the
+    class body, so `__table_args__` can name it, as it can with the ORM's.
+    """
+
+    def test_constraints_take_the_field_itself(self):
+        Scratch = make_base()
+
+        class Account(Scratch):
+            __tablename__ = "account"
+            id: Mapped[int] = rf.mapped_column(primary_key=True)
+            username: Mapped[str] = rf.mapped_column()
+            org: Mapped[int] = rf.mapped_column()
+
+            __table_args__ = (
+                sa.UniqueConstraint(username, name="account_username_key"),
+                sa.Index("ix_account_org_username", org, username.desc()),
+            )
+
+        table = Account.__table__
+        unique = next(c for c in table.constraints if isinstance(c, sa.UniqueConstraint))
+        assert list(unique.columns) == [table.c.username]
+        index = next(iter(table.indexes))
+        assert index.expressions[0] is table.c.org
+
+    def test_expressions_render_with_the_resolved_types(self):
+        Scratch = make_base()
+
+        class Delivery(Scratch):
+            __tablename__ = "delivery"
+            id: Mapped[int] = rf.mapped_column(primary_key=True)
+            # Typed explicitly, as with the ORM: the body binds `Colour.RED` before
+            # the annotation is resolved, and an untyped literal cannot render.
+            colour: Mapped[Colour] = rf.mapped_column(sa.Enum(Colour))
+            sent_at: Mapped[dt.datetime | None] = rf.mapped_column()
+            deleted_at: Mapped[dt.datetime | None] = rf.mapped_column()
+
+            __table_args__ = (
+                sa.CheckConstraint(
+                    sa.or_(colour != Colour.RED, sent_at.is_not(None)), name="delivery_chk"
+                ),
+                sa.Index(
+                    "uq_delivery_live", id, unique=True, postgresql_where=deleted_at.is_(None)
+                ),
+            )
+
+        ddl = str(sa.schema.CreateTable(Delivery.__table__).compile(dialect=postgresql.dialect()))
+        assert "CHECK (colour != 'RED' OR sent_at IS NOT NULL)" in ddl
+        index = str(
+            sa.schema.CreateIndex(next(iter(Delivery.__table__.indexes))).compile(
+                dialect=postgresql.dialect()
+            )
+        )
+        assert "WHERE deleted_at IS NULL" in index
+        assert Delivery.__table__.c.sent_at.nullable
+        assert not Delivery.__table__.c.colour.nullable
+
+    def test_a_referenced_column_binds_with_its_resolved_type(self):
+        """The type is resolved after the class body ran; a comparison built later
+        must not keep the untyped comparator the body used.
+        """
+        Scratch = make_base()
+
+        class Ticket(Scratch):
+            __tablename__ = "ticket"
+            id: Mapped[uuid.UUID] = rf.mapped_column(primary_key=True)
+            __table_args__ = (sa.Index("ix_ticket_id", id.desc()),)
+
+        assert isinstance((Ticket.id == uuid.uuid4()).right.type, sa.Uuid)
+
+    def test_a_mixin_foreign_key_serves_every_model_below_it(self):
+        Scratch = make_base()
+
+        class Org(Scratch):
+            __tablename__ = "org"
+            id: Mapped[int] = rf.mapped_column(primary_key=True)
+
+        class Owned(Scratch):
+            org_id: Mapped[int] = rf.mapped_column(sa.ForeignKey("org.id"))
+
+        class Project(Owned):
+            __tablename__ = "project"
+            id: Mapped[int] = rf.mapped_column(primary_key=True)
+
+        class Team(Owned):
+            __tablename__ = "team"
+            id: Mapped[int] = rf.mapped_column(primary_key=True)
+
+        for model in (Project, Team):
+            (fk,) = model.__table__.c.org_id.foreign_keys
+            assert fk.column is Org.__table__.c.id
 
 
 class TestMixinsAndOrder:
