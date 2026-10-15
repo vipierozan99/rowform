@@ -41,6 +41,8 @@ classifiers = [
 # `_returning`, `SimpleResultMetaData`, `IteratorResult._source_supports_scalars`,
 # `Column._copy`/`_set_type`/`_reset_memoizations` and `TypeEngine._isnull`
 # (class-body columns, pinned by `tests/test_model.py::TestClassBodyReferences`),
+# `dialect.compiler_linting` with `compiler.WARN_LINTING` (from-linting, pinned by
+# `tests/test_engines.py::TestStatementMatrix::test_a_cartesian_product_warns_as_core_does`),
 # `util.await_only`, and the asyncpg adapter's `_started`/`_start_transaction`
 # and `_asyncpg_error_translate` (pinned by `tests/test_driver_errors.py`).
 # Those are the compiler and result internals — none of them carry a
