@@ -6,6 +6,7 @@ import dataclasses
 import datetime as dt
 import decimal
 import enum
+import typing
 import uuid
 from abc import ABC
 
@@ -16,6 +17,11 @@ from sqlalchemy.dialects.sqlite import aiosqlite
 from sqlalchemy.orm import Mapped
 
 import rowform as rf
+
+# Module level: string annotations resolve against module globals.
+UserId = typing.NewType("UserId", uuid.UUID)
+PatientId = typing.NewType("PatientId", UserId)
+Slug = typing.NewType("Slug", str)
 
 
 def make_base():
@@ -120,6 +126,25 @@ class TestTableConstruction:
             body: Mapped[str]
 
         assert isinstance(Doc.__table__.c.body.type, sa.Text)
+
+    def test_a_newtype_resolves_through_its_supertype(self):
+        """As SQLAlchemy does: the NewType itself first, then its flattened supertype."""
+
+        class Scratch(rf.Base):
+            metadata = sa.MetaData()
+            type_annotation_map = {Slug: sa.Text()}
+
+        class Person(Scratch):
+            __tablename__ = "person"
+            id: Mapped[PatientId] = rf.mapped_column(primary_key=True)
+            owner: Mapped[UserId | None]
+            slug: Mapped[Slug]
+
+        columns = Person.__table__.c
+        assert isinstance(columns.id.type, sa.Uuid)
+        assert isinstance(columns.owner.type, sa.Uuid)
+        assert columns.owner.nullable
+        assert isinstance(columns.slug.type, sa.Text)
 
     def test_an_unmapped_python_type_is_refused_with_a_way_out(self):
         Scratch = make_base()
