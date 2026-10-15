@@ -634,6 +634,21 @@ class TestGuards:
                 id: Mapped[int] = rf.mapped_column(primary_key=True)
                 thing: Mapped[int | str]
 
+    def test_a_multi_type_union_with_an_explicit_type_is_declared(self):
+        """A union only fails when rowform has to look its type up, as in SQLAlchemy:
+        one JSON column holding either of two payload shapes is fine."""
+        Scratch = make_base()
+
+        class Event(Scratch):
+            __tablename__ = "event"
+            id: Mapped[int] = rf.mapped_column(primary_key=True)
+            payload: Mapped[dict | list] = rf.mapped_column(sa.JSON())
+            note: Mapped[int | str | None] = rf.mapped_column(sa.String())
+
+        assert isinstance(Event.__table__.c.payload.type, sa.JSON)
+        assert not Event.__table__.c.payload.nullable
+        assert Event.__table__.c.note.nullable
+
     def test_metaclass_conflict_is_real_and_documented(self):
         """Every model carries ModelMeta, so combining with ABC or Protocol
         raises. Accepted rather than worked around — a decorator would compose
