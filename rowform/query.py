@@ -12,6 +12,7 @@ from typing import Any, Generic, TypeVar
 
 from sqlalchemy import Select
 from sqlalchemy.engine.result import SimpleResultMetaData
+from sqlalchemy.sql import compiler
 
 from .compile import compile_hydrator
 from .errors import PlanError
@@ -44,10 +45,13 @@ class CoreQuery(Generic[R]):
         # Compiled *with* the cache key, or `bind()` could not substitute another
         # statement's literals (`extracted_parameters`).
         cache_key = statement._generate_cache_key()
+        # The engine's `enable_from_linting`, as Core's execute applies it: a
+        # cartesian product warns once per compiled shape.
+        linting = dialect.compiler_linting | compiler.WARN_LINTING
         compiled = self._compiled = (
-            statement.compile(dialect=dialect, cache_key=cache_key)
+            statement.compile(dialect=dialect, cache_key=cache_key, linting=linting)
             if cache_key is not None
-            else statement.compile(dialect=dialect)
+            else statement.compile(dialect=dialect, linting=linting)
         )
         # For an expanding statement this holds a POSTCOMPILE placeholder; `bind()`
         # returns the executable string.
