@@ -44,6 +44,9 @@ classifiers = [
 # `compiled._result_columns` (Result keys, pinned by `tests/test_result.py::TestKeysMatchCore`),
 # `dialect.compiler_linting` with `compiler.WARN_LINTING` (from-linting, pinned by
 # `tests/test_engines.py::TestStatementMatrix::test_a_cartesian_product_warns_as_core_does`),
+# `compiled.insert_prefetch`/`update_prefetch`, `_within_exec_param_key_getter` and
+# `Column._default_description_tuple`/`_onupdate_description_tuple` (Python-side
+# column defaults, pinned by `tests/test_engines.py::TestColumnDefaults`),
 # `util.await_only`, and the asyncpg adapter's `_started`/`_start_transaction`
 # and `_asyncpg_error_translate` (pinned by `tests/test_driver_errors.py`).
 # Those are the compiler and result internals — none of them carry a
