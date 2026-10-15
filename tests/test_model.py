@@ -128,6 +128,22 @@ class TestTableConstruction:
 
         assert isinstance(Doc.__table__.c.body.type, sa.Text)
 
+    def test_a_type_class_in_the_map_is_instantiated(self):
+        """`{uuid.UUID: SmartUUID}` with no parentheses, as SQLAlchemy accepts."""
+
+        class Scratch(rf.Base):
+            metadata = sa.MetaData()
+            type_annotation_map = {str: sa.Text}
+
+        class Doc(Scratch):
+            __tablename__ = "doc"
+            id: Mapped[int] = rf.mapped_column(primary_key=True)
+            body: Mapped[str]
+            title: Mapped[str] = rf.mapped_column(unique=True)
+
+        assert isinstance(Doc.__table__.c.body.type, sa.Text)
+        assert isinstance(Doc.__table__.c.title.type, sa.Text)
+
     def test_a_newtype_resolves_through_its_supertype(self):
         """As SQLAlchemy does: the NewType itself first, then its flattened supertype."""
 
