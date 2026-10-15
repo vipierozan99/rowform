@@ -126,6 +126,12 @@ def _sa_type(py_type: Any, type_map: dict[Any, Any]) -> sa.types.TypeEngine[Any]
             continue
         if found is not None:
             return found
+    if isinstance(py_type, typing.NewType):
+        # SQLAlchemy's fallback: an unmapped NewType resolves as its root supertype.
+        root = py_type.__supertype__
+        while isinstance(root, typing.NewType):
+            root = root.__supertype__
+        return _sa_type(root, type_map)
     raise DeclarationError(
         f"no SQLAlchemy type registered for {py_type!r}. Add it to your Base's "
         f"`type_annotation_map`, or name the type explicitly with "
