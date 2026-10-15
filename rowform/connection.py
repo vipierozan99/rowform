@@ -208,9 +208,7 @@ class Connection:
         plan = query.entities
         assert plan is not None  # _require_rows guarantees it
         chunks = engine._chunks(query, bound, extracted, chunk, self._pinned)
-        return AsyncResult(
-            _result.chunked_result(query.result_metadata, chunks, scalars=not plan.wrap)
-        )
+        return AsyncResult(_result.chunked_result(plan, query.result_metadata, chunks))
 
     async def stream_scalars(
         self, statement: Any, parameters: Any = None, *, chunk: int = 1000, **params: Any
