@@ -434,7 +434,7 @@ def _finish(
     if column.name is None:
         column.name = column.key = field_name
     if column.type._isnull:
-        column._set_type(_sa_type(spec.py_type, type_map))
+        column._set_type(sa.types.to_instance(_sa_type(spec.py_type, type_map)))
     if column.primary_key:
         column.nullable = False
     elif "nullable" not in spec.marker.kwargs:
