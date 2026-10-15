@@ -39,6 +39,8 @@ classifiers = [
 # `compiled._bind_processors`, `escaped_bind_names`,
 # `_process_parameters_for_postcompile`, `positiontup`, `_limit_clause`,
 # `_returning`, `SimpleResultMetaData`, `IteratorResult._source_supports_scalars`,
+# `Column._copy`/`_set_type`/`_reset_memoizations` and `TypeEngine._isnull`
+# (class-body columns, pinned by `tests/test_model.py::TestClassBodyReferences`),
 # `util.await_only`, and the asyncpg adapter's `_started`/`_start_transaction`
 # and `_asyncpg_error_translate` (pinned by `tests/test_driver_errors.py`).
 # Those are the compiler and result internals — none of them carry a

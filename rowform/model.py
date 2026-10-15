@@ -30,6 +30,7 @@ from typing import (
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Mapped
+from sqlalchemy.sql.operators import ColumnOperators
 
 from .errors import DeclarationError
 
@@ -67,20 +68,38 @@ DEFAULT_TYPE_MAP: dict[Any, sa.types.TypeEngine[Any]] = {
 }
 
 
-class _MappedColumn:
+class _MappedColumn(ColumnOperators):
     """Marker left in the class body by `mapped_column()`. It must not survive class
     creation: `dataclasses` probes `getattr(cls, name)` for a default, and a
     marker still on the class would become every field's default.
+
+    Inside the class body it stands for its column, so `__table_args__` can name it
+    (`UniqueConstraint(username)`, `CheckConstraint(sent_at.is_not(None))`) as with
+    the ORM's `mapped_column()`. The column is built here and given its name, type
+    and nullability once the annotations are resolved.
     """
 
-    __slots__ = ("args", "default", "default_factory", "init", "kwargs")
+    __slots__ = ("claimed", "column", "default", "default_factory", "init", "kwargs")
 
     def __init__(self, args, kwargs, default, default_factory, init):
-        self.args = args
+        self.column: sa.Column[Any] = sa.Column(*args, **kwargs)
         self.kwargs = kwargs
         self.default = default
         self.default_factory = default_factory
         self.init = init
+        self.claimed = False
+
+    # `ColumnOperators` defines `__eq__`; a marker is still a dict key in `ns`.
+    __hash__ = object.__hash__
+
+    def __clause_element__(self) -> Any:
+        return self.column
+
+    def operate(self, op: Any, *other: Any, **kwargs: Any) -> Any:
+        return op(self.column, *other, **kwargs)
+
+    def reverse_operate(self, op: Any, other: Any, **kwargs: Any) -> Any:
+        return op(other, self.column, **kwargs)
 
 
 def mapped_column(
@@ -251,12 +270,14 @@ class _Spec:
     inherit the declaration: a `Column` belongs to exactly one `Table`.
     """
 
-    __slots__ = ("marker", "nullable", "py_type")
+    __slots__ = ("column", "marker", "nullable", "py_type")
 
     def __init__(self, py_type, nullable, marker):
         self.py_type = py_type
         self.nullable = nullable
         self.marker = marker
+        #: The column built for the declaring class; inheritors get a `_copy()`.
+        self.column: sa.Column[Any] | None = None
 
 
 class _Field:
@@ -327,18 +348,22 @@ def _collect_specs(cls: type, bases: tuple[type, ...], ns: dict[str, Any]) -> di
 
 
 def _build_fields(cls: type, specs: dict[str, _Spec]) -> dict[str, _Field]:
-    """One fresh `sa.Column` per declared field; a `Column` belongs to one `Table`."""
+    """One `sa.Column` per declared field: the marker's own for the class that
+    declares it, a `_copy()` for every class inheriting it, since a `Column` (and
+    its `ForeignKey`) belongs to one `Table`.
+    """
     type_map = {**DEFAULT_TYPE_MAP, **getattr(cls, "type_annotation_map", {})}
     fields: dict[str, _Field] = {}
     for field_name, spec in specs.items():
         marker = spec.marker
-        kwargs = dict(marker.kwargs)
-        kwargs.setdefault("nullable", spec.nullable)
-        if kwargs.get("primary_key"):
-            kwargs["nullable"] = False
-        column = sa.Column(
-            *_column_args(field_name, marker.args, spec.py_type, type_map), **kwargs
-        )
+        if spec.column is not None:
+            column = spec.column._copy()
+        elif marker.claimed:
+            # One `mapped_column()` object assigned in two class bodies.
+            column = _finish(marker.column._copy(), field_name, spec, type_map)
+        else:
+            marker.claimed = True
+            column = spec.column = _finish(marker.column, field_name, spec, type_map)
         fields[field_name] = _Field(
             spec.py_type | None if spec.nullable else spec.py_type,
             column,
@@ -349,30 +374,22 @@ def _build_fields(cls: type, specs: dict[str, _Spec]) -> dict[str, _Field]:
     return fields
 
 
-def _column_args(
-    field_name: str, args: tuple[Any, ...], py_type: Any, type_map: dict[Any, Any]
-) -> tuple[Any, ...]:
-    """`sa.Column` wants `(name, type, *schema_items)`, so the annotation-derived type
-    is spliced in after an optional leading name and before the rest.
-    """
-    name = field_name
-    rest = list(args)
-    if rest and isinstance(rest[0], str):
-        name = rest.pop(0)
-
-    explicit = next(
-        (
-            a
-            for a in rest
-            if isinstance(a, sa.types.TypeEngine)
-            or (isinstance(a, type) and issubclass(a, sa.types.TypeEngine))
-        ),
-        None,
-    )
-    if explicit is None:
-        return (name, _sa_type(py_type, type_map), *rest)
-    rest.remove(explicit)
-    return (name, explicit, *rest)
+def _finish(
+    column: sa.Column[Any], field_name: str, spec: _Spec, type_map: dict[Any, Any]
+) -> sa.Column[Any]:
+    """Name, type and nullability from the annotation, where `mapped_column()` gave none."""
+    if column.name is None:
+        column.name = column.key = field_name
+    if column.type._isnull:
+        column._set_type(_sa_type(spec.py_type, type_map))
+    if column.primary_key:
+        column.nullable = False
+    elif "nullable" not in spec.marker.kwargs:
+        column.nullable = spec.nullable
+    # The class body may already have compared against the untyped column; its
+    # memoized comparator would bind later values without the resolved type.
+    column._reset_memoizations()
+    return column
 
 
 class Base(metaclass=ModelMeta):
