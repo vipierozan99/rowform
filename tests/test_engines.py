@@ -238,6 +238,16 @@ class TestStatementMatrix:
         assert [a.name for a in rows] == ["ada", "brian", "dan"]
         assert all(isinstance(a, Author) for a in rows)
 
+    async def test_a_text_column_keeps_its_slot(self, engine):
+        """`selected_columns` leaves a bare `text()` out; the driver does not."""
+        first = sa.select(sa.text("'a'"), Author.id).where(Author.id == 1)
+        second = sa.select(sa.text("'b'"), Author.id).where(Author.id == 2)
+        assert await engine.fetch_all(first) == [("a", 1)]
+        assert await engine.fetch_all(first.union_all(second).order_by(sa.text("2"))) == [
+            ("a", 1),
+            ("b", 2),
+        ]
+
     async def test_a_model_over_a_selectable_hydrates(self, engine):
         """Declared in its own order; the rows come back in the selectable's."""
 
