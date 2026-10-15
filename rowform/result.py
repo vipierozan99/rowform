@@ -115,3 +115,13 @@ def chunked_result(
                 return
 
     return ChunkedIteratorResult(metadata, sync_chunks, source_supports_scalars=scalars)
+
+
+def sync_chunked_result(
+    metadata: Any,
+    make_chunks: Callable[[int | None], Iterator[list[Any]]],
+    *,
+    scalars: bool = False,
+) -> ChunkedIteratorResult:
+    """`chunked_result` for a plain generator: no greenlet to await in."""
+    return ChunkedIteratorResult(metadata, make_chunks, source_supports_scalars=scalars)
