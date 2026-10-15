@@ -176,9 +176,15 @@ class ModelMeta(type):
         # Only to resolve string annotations against the real MRO.
         probe = super().__new__(mcls, name, bases, dict(ns))
         specs = _collect_specs(probe, bases, ns)
-        fields = _build_fields(probe, specs)
+        selectable = ns.get("__table__")
+        if selectable is None:
+            fields = _build_fields(probe, specs)
+        else:
+            fields = _fields_over(name, specs, selectable)
 
-        abstract = ns.get("__abstract__", False) or "__tablename__" not in ns
+        abstract = selectable is None and (
+            ns.get("__abstract__", False) or "__tablename__" not in ns
+        )
         if not fields:
             if not abstract:
                 raise DeclarationError(
@@ -221,7 +227,9 @@ class ModelMeta(type):
             ) from err
 
         columns = {n: f.column for n, f in fields.items()}
-        if not abstract:
+        if selectable is not None:
+            setattr(selectable, MODEL_ATTR, built)
+        elif not abstract:
             table = sa.Table(
                 ns["__tablename__"],
                 built.metadata,
@@ -370,6 +378,51 @@ def _build_fields(cls: type, specs: dict[str, _Spec]) -> dict[str, _Field]:
             marker.default,
             marker.default_factory,
             marker.init,
+        )
+    return fields
+
+
+def _fields_over(name: str, specs: dict[str, _Spec], selectable: Any) -> dict[str, _Field]:
+    """Fields over the columns of `__table__`, a view or subquery declared elsewhere.
+    It owns the columns, so every one must be declared (a `select()` of it expands to
+    all of them), and `mapped_column()` may only rename or set dataclass options.
+    """
+    if not isinstance(selectable, sa.FromClause):
+        raise DeclarationError(
+            f"{name}.__table__ must be a FromClause (a view's table clause, a "
+            f"subquery, a CTE), not {type(selectable).__name__}"
+        )
+    available = selectable.columns
+    fields: dict[str, _Field] = {}
+    for field_name, spec in specs.items():
+        marker = spec.marker
+        own = marker.column
+        if set(marker.kwargs) - {"default"} or not own.type._isnull or own.foreign_keys:
+            raise DeclarationError(
+                f"{name}.{field_name}: a model over a selectable takes its columns from "
+                f"__table__; mapped_column() may only rename the field or set "
+                f"default/default_factory/init"
+            )
+        key = own.name or field_name
+        column = available.get(key)
+        if column is None:
+            raise DeclarationError(
+                f"{name}.{field_name}: __table__ has no column {key!r}; it has "
+                f"{list(available.keys())}"
+            )
+        fields[field_name] = _Field(
+            spec.py_type | None if spec.nullable else spec.py_type,
+            column,
+            marker.default,
+            marker.default_factory,
+            marker.init,
+        )
+    declared = {field.column.key for field in fields.values()}
+    undeclared = [column.key for column in available if column.key not in declared]
+    if undeclared:
+        raise DeclarationError(
+            f"{name} does not declare {undeclared} of its __table__; a select() of it "
+            f"returns every column, so each needs a field"
         )
     return fields
 
