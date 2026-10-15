@@ -41,6 +41,9 @@ classifiers = [
 # `_returning`, `SimpleResultMetaData`, `IteratorResult._source_supports_scalars`,
 # `Column._copy`/`_set_type`/`_reset_memoizations` and `TypeEngine._isnull`
 # (class-body columns, pinned by `tests/test_model.py::TestClassBodyReferences`),
+# `compiled.insert_prefetch`/`update_prefetch`, `_within_exec_param_key_getter` and
+# `Column._default_description_tuple`/`_onupdate_description_tuple` (Python-side
+# column defaults, pinned by `tests/test_engines.py::TestColumnDefaults`),
 # `dialect.compiler_linting` with `compiler.WARN_LINTING` (from-linting, pinned by
 # `tests/test_engines.py::TestStatementMatrix::test_a_cartesian_product_warns_as_core_does`),
 # `util.await_only`, and the asyncpg adapter's `_started`/`_start_transaction`

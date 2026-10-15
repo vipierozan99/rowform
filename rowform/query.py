@@ -15,7 +15,7 @@ from sqlalchemy.engine.result import SimpleResultMetaData
 from sqlalchemy.sql import compiler
 
 from .compile import compile_hydrator
-from .errors import PlanError
+from .errors import PlanError, UnsupportedError
 from .planner import Plan, plan
 
 _LOG = logging.getLogger("rowform")
@@ -34,6 +34,7 @@ class CoreQuery(Generic[R]):
         "_metadata",
         "_plan",
         "_positional",
+        "_prefetch",
         "dialect",
         "is_select",
         "sql",
@@ -61,6 +62,7 @@ class CoreQuery(Generic[R]):
         self._expanding: bool = bool(
             compiled.post_compile_params or compiled.literal_execute_params
         )
+        self._prefetch = _prefetch_defaults(compiled)
         self._plan: Plan | None = plan(statement) if _returns_rows(statement) else None
         self._hydrate: Any = None
         self._metadata: Any = None
@@ -108,6 +110,8 @@ class CoreQuery(Generic[R]):
         values = compiled.construct_params(
             params or None, extracted_parameters=extracted, escape_names=False
         )
+        if self._prefetch:
+            _fill_defaults(self._prefetch, values, params or {})
 
         if self._expanding:
             state = compiled._process_parameters_for_postcompile(values)
@@ -147,6 +151,55 @@ class CoreQuery(Generic[R]):
 
     def __repr__(self) -> str:
         return f"<CoreQuery {self.sql!r} {self._plan!r}>"
+
+
+def _prefetch_defaults(compiled: Any) -> tuple[Any, ...]:
+    """The Python-side `default=`/`onupdate=` columns Core's execution context fills
+    at execute time: `(column, bind key, (arg, is_scalar, is_callable, is_sentinel))`.
+    The compiler lists them; the description tuples and key getter are private.
+    """
+    if compiled.insert_prefetch:
+        columns, description = compiled.insert_prefetch, "_default_description_tuple"
+    elif compiled.update_prefetch:
+        columns, description = compiled.update_prefetch, "_onupdate_description_tuple"
+    else:
+        return ()
+    key_of = compiled._within_exec_param_key_getter
+    return tuple((column, key_of(column), getattr(column, description)) for column in columns)
+
+
+class _DefaultContext:
+    """What a context-sensitive default (`default=lambda ctx: ...`) may read."""
+
+    __slots__ = ("current_column", "current_parameters")
+
+    def __init__(self, parameters: dict[str, Any]):
+        self.current_parameters = parameters
+        self.current_column: Any = None
+
+    def get_current_parameters(self, isolate_multiinsert_groups: bool = True) -> dict[str, Any]:
+        return self.current_parameters
+
+
+def _fill_defaults(prefetch: tuple[Any, ...], values: dict[str, Any], given: dict[str, Any]) -> None:
+    """Fill each defaulted column the caller left out, as Core's execution context
+    does. Compiled once without the caller's keys, an `insert(table)` lists every
+    defaulted column, so a supplied value must win.
+    """
+    context = _DefaultContext(values)
+    for column, key, (arg, is_scalar, is_callable, _sentinel) in prefetch:
+        if key in given:
+            continue
+        if is_scalar:
+            values[key] = arg
+        elif is_callable:
+            context.current_column = column
+            values[key] = arg(context)
+        else:
+            raise UnsupportedError(
+                f"{column} has a default rowform cannot fill client-side ({arg!r}); "
+                f"give the column a value, or use a server_default"
+            )
 
 
 def _returns_rows(statement: Any) -> bool:
