@@ -178,6 +178,20 @@ class TestTableConstruction:
         assert columns.owner.nullable
         assert isinstance(columns.slug.type, sa.Text)
 
+    def test_a_string_literal_is_a_non_native_enum(self):
+        """SQLAlchemy's mapping for `Literal["a", "b"]`."""
+        Scratch = make_base()
+
+        class Tagged(Scratch):
+            __tablename__ = "tagged"
+            id: Mapped[int] = rf.mapped_column(primary_key=True)
+            kind: Mapped[typing.Literal["a", "b"]]
+
+        kind = Tagged.__table__.c.kind.type
+        assert isinstance(kind, sa.Enum)
+        assert kind.enums == ["a", "b"]
+        assert not kind.native_enum
+
     def test_an_unmapped_python_type_is_refused_with_a_way_out(self):
         Scratch = make_base()
 

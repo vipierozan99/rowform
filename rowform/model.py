@@ -148,6 +148,9 @@ def _sa_type(py_type: Any, type_map: dict[Any, Any]) -> sa.types.TypeEngine[Any]
         )
     if isinstance(py_type, type) and issubclass(py_type, enum.Enum):
         return sa.Enum(py_type)
+    if get_origin(py_type) is typing.Literal and all(isinstance(a, str) for a in get_args(py_type)):
+        # SQLAlchemy's mapping: the values as a VARCHAR-backed, non-native enum.
+        return sa.Enum(*get_args(py_type), native_enum=False)
     for candidate in (py_type, get_origin(py_type)):
         if candidate is None:
             continue
