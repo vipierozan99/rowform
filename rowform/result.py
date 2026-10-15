@@ -2,7 +2,7 @@
 
 Rows are handed to `IteratorResult` as they are, with `_source_supports_scalars`
 saying whether each item is a whole row or a scalar to wrap only if asked — so
-`.scalars()` builds no `Row` at all. Both that flag and `SimpleResultMetaData`
+`.scalars()` over a single model builds no `Row` at all. Both that flag and `SimpleResultMetaData`
 are SQLAlchemy-private; the flag is spelled `source_supports_scalars` on
 `ChunkedIteratorResult`, upstream's inconsistency.
 """
@@ -86,9 +86,29 @@ class _NoRows(_Result):
         return False
 
 
+def _scalar_source(plan: Plan) -> bool:
+    """Whether each hydrated item can stand in for its row. `IteratorResult` reads a
+    bare `None` from a scalar source as "no more rows", so a lone slot that can
+    hydrate to `None` (a column, or an outer-joined model) goes in a 1-tuple instead.
+    """
+    if plan.wrap:
+        return False
+    entity = plan.entities[0]
+    return entity[0] == "model" and not entity[3]
+
+
+def _as_rows(plan: Plan, hydrated: list[Any]) -> list[Any]:
+    if plan.wrap or _scalar_source(plan):
+        return hydrated
+    return [(item,) for item in hydrated]
+
+
 def result_for(plan: Plan, metadata: Any, hydrated: list[Any]) -> _Result:
     return _Result(
-        metadata, iter(hydrated), len(hydrated), _source_supports_scalars=not plan.wrap
+        metadata,
+        iter(_as_rows(plan, hydrated)),
+        len(hydrated),
+        _source_supports_scalars=_scalar_source(plan),
     )
 
 
@@ -97,10 +117,9 @@ def no_rows(report: Any) -> _NoRows:
 
 
 def chunked_result(
+    plan: Plan,
     metadata: Any,
     make_chunks: Callable[[int | None], AsyncIterator[list[Any]]],
-    *,
-    scalars: bool = False,
 ) -> ChunkedIteratorResult:
     """A streaming `Result` fed by an async generator. `AsyncResult` runs the sync
     `Result` inside `greenlet_spawn`, which is what makes `await_only` legal here.
@@ -110,8 +129,10 @@ def chunked_result(
         iterator = make_chunks(size)
         while True:
             try:
-                yield await_only(iterator.__anext__())
+                yield _as_rows(plan, await_only(iterator.__anext__()))
             except StopAsyncIteration:
                 return
 
-    return ChunkedIteratorResult(metadata, sync_chunks, source_supports_scalars=scalars)
+    return ChunkedIteratorResult(
+        metadata, sync_chunks, source_supports_scalars=_scalar_source(plan)
+    )

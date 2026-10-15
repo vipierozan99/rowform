@@ -86,6 +86,28 @@ class TestOneScalarColumn:
             result = await conn.execute(sa.select(Author.name, Author.id))
         assert list(result.keys()) == ["name", "id"]
 
+    async def test_a_null_value_is_still_a_row(self, engine):
+        """A NULL must not read as "no row": `IteratorResult` takes a bare `None`
+        from a scalar source as the end of the rows.
+        """
+        null = sa.select(sa.cast(sa.null(), sa.String))
+        async with engine.connect() as conn:
+            assert (await conn.execute(null)).one() == (None,)
+            assert (await conn.execute(null)).first() == (None,)
+            assert (await conn.execute(null)).one_or_none() == (None,)
+            assert (await conn.execute(null)).scalar_one() is None
+            assert (await conn.scalars(null)).one() is None
+            assert await (await conn.stream(null)).one() == (None,)
+
+
+class TestOneOuterJoinedEntity:
+    async def test_no_match_is_a_row_holding_none(self, engine):
+        """An outer-joined entity with no match hydrates to `None`, which is a row."""
+        statement = sa.select(Book).select_from(Author).outerjoin(Book).where(Author.id == 4)
+        async with engine.connect() as conn:
+            assert (await conn.execute(statement)).one() == (None,)
+            assert (await conn.execute(statement)).scalar_one() is None
+
 
 class TestTwoEntities:
     async def test_all_is_already_a_tuple(self, engine):
