@@ -397,6 +397,93 @@ class TestClassBodyReferences:
             assert fk.column is Org.__table__.c.id
 
 
+class TestModelOverASelectable:
+    """`__table__ = <FromClause>`: a model over rows something else defines (a view,
+    a subquery). Types come from the selectable, so the annotations only shape the
+    dataclass.
+    """
+
+    @staticmethod
+    def view():
+        return sa.table(
+            "active_people",
+            sa.column("id", sa.Integer),
+            sa.column("name", sa.String),
+            sa.column("kind", sa.String),
+        )
+
+    def test_it_maps_the_given_columns_in_any_order(self):
+        view = self.view()
+        Scratch = make_base()
+
+        class ActivePerson(Scratch):
+            __tablename__ = "active_people"
+            __table__ = view
+            name: Mapped[str]
+            kind: Mapped[typing.Literal["staff"]]
+            id: Mapped[int]
+
+        assert ActivePerson.__table__ is view
+        assert ActivePerson.id is view.c.id
+        assert rf.model_for(view) is ActivePerson
+        assert Scratch.metadata.tables == {}, "no Table of its own"
+        assert ActivePerson(name="a", kind="staff", id=1).id == 1
+        (entity,) = rf.plan(sa.select(ActivePerson)).entities
+        assert entity[0] == "model" and entity[1] is ActivePerson
+
+    def test_annotations_need_no_column_type(self):
+        """A discriminated view types a column `None` or a `Literal`; neither maps
+        to a column type, and neither has to."""
+        Scratch = make_base()
+
+        class Unset(Scratch):
+            __table__ = self.view()
+            id: Mapped[int]
+            name: Mapped[None]
+            kind: Mapped[typing.Literal["staff"]]
+
+        assert isinstance(Unset.name.type, sa.String)
+
+    def test_a_column_left_undeclared_is_refused(self):
+        Scratch = make_base()
+        with pytest.raises(TypeError, match=r"does not declare \['kind'\]"):
+
+            class Partial(Scratch):
+                __table__ = self.view()
+                id: Mapped[int]
+                name: Mapped[str]
+
+    def test_a_field_the_selectable_lacks_is_refused(self):
+        Scratch = make_base()
+        with pytest.raises(TypeError, match=r"has no column 'email'"):
+
+            class Extra(Scratch):
+                __table__ = self.view()
+                id: Mapped[int]
+                name: Mapped[str]
+                kind: Mapped[str]
+                email: Mapped[str]
+
+    def test_column_options_are_refused(self):
+        """The selectable owns its columns; only the dataclass options apply."""
+        Scratch = make_base()
+        with pytest.raises(TypeError, match="takes its columns from __table__"):
+
+            class Keyed(Scratch):
+                __table__ = self.view()
+                id: Mapped[int] = rf.mapped_column(primary_key=True)
+                name: Mapped[str]
+                kind: Mapped[str]
+
+        class Defaulted(Scratch):
+            __table__ = self.view()
+            id: Mapped[int]
+            name: Mapped[str]
+            kind: Mapped[str] = rf.mapped_column(default="staff")
+
+        assert Defaulted(id=1, name="a").kind == "staff"
+
+
 class TestMixinsAndOrder:
     def test_mixin_fields_are_inherited_as_real_columns(self):
         Scratch = make_base()
