@@ -96,10 +96,25 @@ class TestTableConstruction:
             id: Mapped[int] = rf.mapped_column(primary_key=True)
             title: Mapped[str] = rf.mapped_column("headline", index=True)
 
-        assert Renamed.__table__.c.keys() == ["id", "headline"]
+        # As in SQLAlchemy: the key stays the field name, only the SQL name changes,
+        # so `asdict(instance)` is a valid `insert().values(...)` mapping.
+        assert Renamed.__table__.c.keys() == ["id", "title"]
         assert Renamed.title.name == "headline"
-        # The attribute keeps the Python name; only the DB column is renamed.
         assert Renamed(id=1, title="t").title == "t"
+        assert Renamed.__table__.c.title is Renamed.title
+        compiled = sa.insert(Renamed).values(dataclasses.asdict(Renamed(id=1, title="t"))).compile()
+        assert "headline" in str(compiled)
+
+    def test_a_name_keyword_renames_the_column_too(self):
+        Scratch = make_base()
+
+        class Renamed(Scratch):
+            __tablename__ = "renamed"
+            id: Mapped[int] = rf.mapped_column(primary_key=True)
+            session_date: Mapped[dt.date] = rf.mapped_column(name="implant_session_date")
+
+        assert Renamed.__table__.c.keys() == ["id", "session_date"]
+        assert Renamed.session_date.name == "implant_session_date"
 
     def test_table_args_pass_through(self):
         Scratch = make_base()

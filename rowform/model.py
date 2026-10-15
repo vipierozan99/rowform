@@ -442,9 +442,13 @@ def _fields_over(name: str, specs: dict[str, _Spec], selectable: Any) -> dict[st
 def _finish(
     column: sa.Column[Any], field_name: str, spec: _Spec, type_map: dict[Any, Any]
 ) -> sa.Column[Any]:
-    """Name, type and nullability from the annotation, where `mapped_column()` gave none."""
+    """Name, type and nullability from the annotation, where `mapped_column()` gave none.
+    The key is the field name even when the SQL name differs, as in SQLAlchemy.
+    """
     if column.name is None:
-        column.name = column.key = field_name
+        column.name = field_name
+    if "key" not in spec.marker.kwargs:
+        column.key = field_name
     if column.type._isnull:
         column._set_type(sa.types.to_instance(_sa_type(spec.py_type, type_map)))
     if column.primary_key:
