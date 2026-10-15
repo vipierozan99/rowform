@@ -15,6 +15,8 @@ import dataclasses
 import datetime
 import decimal
 import enum
+import functools
+import operator
 import types
 import typing
 import uuid
@@ -119,21 +121,31 @@ def mapped_column(
     return _MappedColumn(args, kwargs, default, default_factory, init)
 
 
-def _unwrap_optional(annotation: Any) -> tuple[Any, bool]:
-    """`Mapped[str | None]` -> (str, nullable=True)."""
+def _is_union(annotation: Any) -> bool:
     origin = get_origin(annotation)
-    if origin is typing.Union or origin is types.UnionType:
-        present = [a for a in get_args(annotation) if a is not type(None)]
-        if len(present) != 1:
-            raise DeclarationError(
-                f"Mapped[{annotation}] is a union of more than one non-None type; "
-                f"rowform maps one Python type to one column"
-            )
-        return present[0], True
+    return origin is typing.Union or origin is types.UnionType
+
+
+def _unwrap_optional(annotation: Any) -> tuple[Any, bool]:
+    """`Mapped[str | None]` -> (str, nullable=True); `Mapped[A | B]` keeps the union,
+    which needs its column type named."""
+    if _is_union(annotation):
+        args = get_args(annotation)
+        present = [a for a in args if a is not type(None)]
+        nullable = len(present) != len(args)
+        if len(present) == 1:
+            return present[0], nullable
+        return functools.reduce(operator.or_, present), nullable
     return annotation, False
 
 
 def _sa_type(py_type: Any, type_map: dict[Any, Any]) -> sa.types.TypeEngine[Any]:
+    if _is_union(py_type):
+        raise DeclarationError(
+            f"Mapped[{py_type}] is a union of more than one non-None type; "
+            f"rowform maps one Python type to one column. Name the column type "
+            f"explicitly with `mapped_column(sa.SomeType())`."
+        )
     if isinstance(py_type, type) and issubclass(py_type, enum.Enum):
         return sa.Enum(py_type)
     for candidate in (py_type, get_origin(py_type)):
