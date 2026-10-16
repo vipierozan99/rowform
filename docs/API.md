@@ -138,6 +138,10 @@ selected entity gives `list[T]`, two to four give `list[tuple[...]]` in select
 order, more degrades to `list[Any]`. `StatementError` for a statement returning
 no rows.
 
+Statements compile with the engine's `enable_from_linting` (on by default, as in
+`create_async_engine`), so a SELECT with a cartesian product warns as it would
+through Core, once per compiled shape.
+
 A one-shot `SELECT` **checks out from the pool directly and runs outside any
 transaction**: no `Connection`/`AsyncConnection` is built, no `BEGIN` is sent,
 and on psycopg the driver's `autocommit` is flipped on for the statement. No
@@ -283,6 +287,13 @@ every accessor is the upstream implementation:
 The tracks differ in one place: for a single selected entity `execute().all()`
 gives `[Row(User,)]` and `fetch_all()` gives `[User]`. At two or more they agree.
 
+`Result.keys()` are Core's: the compiler's names for the selected columns, so a
+repeated `id` is `id`, `id_1`, an unnamed expression `anon_1`, `func.count()`
+`count_1`. A whole model is keyed by its class name, and a column beside it keeps its
+own name even where Core's would be suffixed against the model's columns. A bare
+`text()` column is keyed by its text. A NULL in a single selected column is a row
+like any other: `one()` gives `(None,)`, `scalar_one()` gives `None`.
+
 ### `rf.active_connection() -> Connection | None`
 
 The innermost scope open in this task (bound scopes included).
@@ -319,7 +330,7 @@ SQLAlchemy (see [Disconnects](#disconnects) and the Errors note below it).
 | | |
 |---|---|
 | `rf.CoreQuery` | one statement compiled for one dialect: `.sql`, `.returns_rows`, `.is_select`, `.entities`, `.bind(params, extracted)`, `.hydrator(dialect, description)` |
-| `rf.plan(statement) -> Plan` | what the rows mean: a from clause selected whole is a model, anything else a scalar; a hand-listed full column list stays scalars. `Plan.wrap` is true at two or more entities |
+| `rf.plan(statement) -> Plan` | what the rows mean: a from clause selected whole is a model, anything else a scalar (a bare `text()` included); a hand-listed full column list stays scalars. `Plan.wrap` is true at two or more entities |
 | `rf.compile_hydrator(plan, dialect, coltypes)` | the generated `rows -> list` function; source on `__source__`; `PlanError` if the column counts disagree |
 | `rf.result_processor(column, dialect, coltype)` | the dialect-adapted type's decoder, or `None` for a bare store |
 | `rf.Driver` / `rf.driver_for(dialect)` | per-driver `fetch`/`stream`/`execute`/`execute_many`/`copy_in`/`pipeline`/`autocommit`, plus `errors`/`translate` for SQLAlchemy-compatible driver errors; the seam a mock replaces |
