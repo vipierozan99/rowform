@@ -156,3 +156,20 @@ def test_column_order_drift_is_invisible_to_alembic(blank_db):
         diffs = compare_metadata(context(conn, reordered), reordered)
     assert diffs == [], "if this ever fails, alembic learned to diff column order"
     assert list(reordered.tables["t_wide"].c.keys()) != list(Wide.__column_order__)
+
+
+def test_a_view_is_created_by_a_migration_and_invisible_to_autogenerate(blank_db):
+    """`rf.view()` stays out of `metadata.tables`, so autogenerate neither adds it
+    as a table nor, once it exists, reports it as one to drop.
+    """
+    from alembic.operations import Operations
+
+    metadata = sa.MetaData()
+    table = sa.Table("t_people", metadata, sa.Column("id", sa.Integer, primary_key=True))
+    people = rf.view("v_people", metadata, sa.select(table.c.id))
+    with blank_db.begin() as conn:
+        metadata.tables["t_people"].create(conn)
+        Operations(MigrationContext.configure(conn)).execute(rf.CreateView(people))
+        assert "v_people" in sa.inspect(conn).get_view_names()
+        diffs = compare_metadata(context(conn, metadata), metadata)
+    assert diffs == []
