@@ -2,7 +2,7 @@
 
 Rows are handed to `IteratorResult` as they are, with `_source_supports_scalars`
 saying whether each item is a whole row or a scalar to wrap only if asked — so
-`.scalars()` builds no `Row` at all. Both that flag and `SimpleResultMetaData`
+`.scalars()` over a single model builds no `Row` at all. Both that flag and `SimpleResultMetaData`
 are SQLAlchemy-private; the flag is spelled `source_supports_scalars` on
 `ChunkedIteratorResult`, upstream's inconsistency.
 """
@@ -22,17 +22,30 @@ from sqlalchemy.util import await_only
 from .planner import Plan
 
 
-def keys_for(plan: Plan) -> list[str]:
-    """Column labels for one statement's rows: a model by its class name, a scalar by
-    its column key, as the ORM does. Duplicates are left to SQLAlchemy to report.
+def keys_for(plan: Plan, compiled: Any) -> list[str]:
+    """Column labels for one statement's rows: a model by its class name, as the ORM
+    does; a scalar by the name Core gives it, the compiler's result column (`id_1`
+    for a repeated `id`, `anon_1` for an unnamed expression). `_result_columns` is
+    SQLAlchemy-private. A bare `text()` has no compiled name; it is keyed by its text.
     """
+    names = [column.keyname for column in compiled._result_columns]
+    if len(names) != len(plan.columns):
+        names = [None] * len(plan.columns)
     keys: list[str] = []
+    offset = 0
     for entity in plan.entities:
         if entity[0] == "model":
             keys.append(entity[1].__name__)
-        else:
-            column = entity[1]
-            keys.append(getattr(column, "key", None) or getattr(column, "name", None) or str(column))
+            offset += len(entity[2])
+            continue
+        name = names[offset] or str(entity[1])
+        # The compiler deduplicates against a model's columns too, which the row
+        # does not show: `select(Author, Book.id)` keeps `id`, as the ORM does.
+        own = getattr(entity[1], "key", None)
+        if own and name != own and name.startswith(f"{own}_") and own not in keys:
+            name = own
+        keys.append(name)
+        offset += 1
     return keys
 
 
@@ -86,9 +99,32 @@ class _NoRows(_Result):
         return False
 
 
+def _scalar_source(plan: Plan) -> bool:
+    """Whether each hydrated item can always stand in for its row. `IteratorResult`
+    reads a bare `None` from a scalar source as "no more rows", so a lone slot that
+    can hydrate to `None` (a column, or an outer-joined model) may not.
+    """
+    if plan.wrap:
+        return False
+    entity = plan.entities[0]
+    return entity[0] == "model" and not entity[3]
+
+
+def _as_rows(plan: Plan, hydrated: list[Any]) -> list[Any]:
+    if plan.wrap or _scalar_source(plan):
+        return hydrated
+    return [(item,) for item in hydrated]
+
+
 def result_for(plan: Plan, metadata: Any, hydrated: list[Any]) -> _Result:
+    # A lone slot that could be `None` but is not in this batch keeps the scalar
+    # source, so `.scalars()` builds no `Row`; `None in` is a C-level scan.
+    scalars = not plan.wrap and (_scalar_source(plan) or None not in hydrated)
     return _Result(
-        metadata, iter(hydrated), len(hydrated), _source_supports_scalars=not plan.wrap
+        metadata,
+        iter(hydrated if plan.wrap or scalars else [(item,) for item in hydrated]),
+        len(hydrated),
+        _source_supports_scalars=scalars,
     )
 
 
@@ -97,10 +133,9 @@ def no_rows(report: Any) -> _NoRows:
 
 
 def chunked_result(
+    plan: Plan,
     metadata: Any,
     make_chunks: Callable[[int | None], AsyncIterator[list[Any]]],
-    *,
-    scalars: bool = False,
 ) -> ChunkedIteratorResult:
     """A streaming `Result` fed by an async generator. `AsyncResult` runs the sync
     `Result` inside `greenlet_spawn`, which is what makes `await_only` legal here.
@@ -110,8 +145,10 @@ def chunked_result(
         iterator = make_chunks(size)
         while True:
             try:
-                yield await_only(iterator.__anext__())
+                yield _as_rows(plan, await_only(iterator.__anext__()))
             except StopAsyncIteration:
                 return
 
-    return ChunkedIteratorResult(metadata, sync_chunks, source_supports_scalars=scalars)
+    return ChunkedIteratorResult(
+        metadata, sync_chunks, source_supports_scalars=_scalar_source(plan)
+    )

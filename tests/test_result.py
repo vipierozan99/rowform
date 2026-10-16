@@ -86,6 +86,38 @@ class TestOneScalarColumn:
             result = await conn.execute(sa.select(Author.name, Author.id))
         assert list(result.keys()) == ["name", "id"]
 
+    async def test_a_null_value_is_still_a_row(self, engine):
+        """A NULL must not read as "no row": `IteratorResult` takes a bare `None`
+        from a scalar source as the end of the rows.
+        """
+        null = sa.select(sa.cast(sa.null(), sa.String))
+        async with engine.connect() as conn:
+            assert (await conn.execute(null)).one() == (None,)
+            assert (await conn.execute(null)).first() == (None,)
+            assert (await conn.execute(null)).one_or_none() == (None,)
+            assert (await conn.execute(null)).scalar_one() is None
+            assert (await conn.scalars(null)).one() is None
+            assert await (await conn.stream(null)).one() == (None,)
+
+    async def test_a_null_among_values_is_still_a_row(self, engine):
+        """Values with no NULL keep the scalar fast path; a batch with one does not."""
+        mixed = sa.select(
+            sa.case((Author.id == 2, sa.null()), else_=Author.name).label("maybe")
+        ).order_by(Author.id)
+        async with engine.connect() as conn:
+            assert (await conn.execute(mixed)).scalars().all() == ["ada", None, "carol", "dan"]
+            assert (await conn.execute(mixed.where(Author.id >= 2))).first() == (None,)
+            assert (await conn.execute(mixed.where(Author.id == 1))).scalar_one() == "ada"
+
+
+class TestOneOuterJoinedEntity:
+    async def test_no_match_is_a_row_holding_none(self, engine):
+        """An outer-joined entity with no match hydrates to `None`, which is a row."""
+        statement = sa.select(Book).select_from(Author).outerjoin(Book).where(Author.id == 4)
+        async with engine.connect() as conn:
+            assert (await conn.execute(statement)).one() == (None,)
+            assert (await conn.execute(statement)).scalar_one() is None
+
 
 class TestTwoEntities:
     async def test_all_is_already_a_tuple(self, engine):
@@ -354,3 +386,38 @@ class TestBothTracksAgree:
             hot = await conn.fetch_all(statement)
             compat = (await conn.execute(statement)).tuples().all()
         assert hot == compat
+
+
+class TestKeysMatchCore:
+    """`Result.keys()` are the names Core gives: the compiler's result columns,
+    so a repeated name is deduplicated and an unnamed expression is `anon_1`.
+    """
+
+    STATEMENTS = {
+        "repeated": sa.select(Author.id, Book.id).join(Book),
+        "count": sa.select(sa.func.count(Author.id)),
+        "cast": sa.select(sa.cast(Author.id, sa.String)),
+        "literal": sa.select(sa.literal(1)),
+        "exists": sa.select(sa.exists().where(Author.id == 1)),
+        "distinct": sa.select(sa.distinct(Author.id)),
+        "label": sa.select(Author.id.label("x")),
+        "returning": sa.update(Author.__table__)
+        .where(Author.id == 1)
+        .values(name="ada")
+        .returning(Author.id, sa.func.lower(Author.name)),
+    }
+
+    @pytest.mark.parametrize("name", list(STATEMENTS))
+    async def test_keys_equal_cores(self, engine, name):
+        statement = self.STATEMENTS[name]
+        async with engine.sa_engine.connect() as core:
+            expected = list((await core.execute(statement)).keys())
+            await core.rollback()
+        async with engine.connect() as conn:
+            assert list((await conn.execute(statement)).keys()) == expected
+
+    async def test_an_entity_keeps_its_class_name(self, engine):
+        """Core has no entity; rowform names it as the ORM does."""
+        async with engine.connect() as conn:
+            result = await conn.execute(sa.select(Author, Book.id).join(Book))
+        assert list(result.keys()) == ["Author", "id"]

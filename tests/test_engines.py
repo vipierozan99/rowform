@@ -7,6 +7,8 @@ strings for temporal types and integers for booleans, postgres decodes natively.
 
 from __future__ import annotations
 
+import warnings
+
 import pytest
 import sqlalchemy as sa
 from conftest import Author, Base, Book, Tag, engine_at, sqlite_url
@@ -250,6 +252,30 @@ class TestStatementMatrix:
 
         rows = await engine.fetch_all(sa.select(AdaBook).order_by(AdaBook.id))
         assert rows == [AdaBook(id=10, title="structures"), AdaBook(id=11, title="algorithms")]
+
+    async def test_a_text_column_keeps_its_slot(self, engine):
+        """`selected_columns` leaves a bare `text()` out; the driver does not."""
+        first = sa.select(sa.text("'a'"), Author.id).where(Author.id == 1)
+        second = sa.select(sa.text("'b'"), Author.id).where(Author.id == 2)
+        assert await engine.fetch_all(first) == [("a", 1)]
+        assert await engine.fetch_all(first.union_all(second).order_by(sa.text("2"))) == [
+            ("a", 1),
+            ("b", 2),
+        ]
+
+    async def test_a_cartesian_product_warns_as_core_does(self, engine):
+        """The engine's `enable_from_linting` (on by default) reaches the compile."""
+        unjoined = sa.select(Author.id, Book.id).where(Author.id == 1, Book.id == 10)
+        with pytest.warns(sa.exc.SAWarning, match="cartesian product"):
+            await engine.fetch_all(unjoined)
+
+    async def test_from_linting_off_is_honoured(self, tmp_path):
+        url = sqlite_url(str(tmp_path / "lint.sqlite3"))
+        async with engine_at(url, enable_from_linting=False) as db:
+            await db.create_all(Base.metadata)
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                await db.fetch_all(sa.select(Author.id, Book.id))
 
     async def test_a_subquery_joins_back_against_its_table(self, engine):
         newest = rf.alias(

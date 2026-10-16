@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import FromClause
+from sqlalchemy import CompoundSelect, FromClause, TextClause
 from sqlalchemy.sql.expression import Join
 
 from .errors import PlanError
@@ -46,9 +46,7 @@ class Plan:
 
 def plan(stmt: Any) -> Plan:
     """Build the entity plan for a `Select`, or for a write with RETURNING."""
-    columns = list(
-        stmt.selected_columns if getattr(stmt, "is_select", False) else stmt.exported_columns
-    )
+    columns = _selected(stmt)
     nullable_froms = _nullable_froms(stmt)
     entity_starts = _entity_starts(stmt)
 
@@ -96,6 +94,40 @@ def _match_model(
         pairs.append((attr, column))
 
     return ("model", model, pairs, id(from_clause) in nullable_froms), width
+
+
+def _selected(stmt: Any) -> list[Any]:
+    """`selected_columns`, with each bare `text()` element back in its slot: the
+    collection leaves them out, but the driver returns them.
+    """
+    selected = list(
+        stmt.selected_columns if getattr(stmt, "is_select", False) else stmt.exported_columns
+    )
+    raw = _raw(stmt)
+    if not any(isinstance(element, TextClause) for element in raw):
+        return selected
+    remaining = iter(selected)
+    columns: list[Any] = []
+    for element in raw:
+        if isinstance(element, TextClause):
+            columns.append(element)
+        elif isinstance(element, FromClause):
+            columns.extend(next(remaining) for _ in element.exported_columns)
+        else:
+            columns.append(next(remaining))
+    return columns
+
+
+def _raw(stmt: Any) -> Any:
+    """The select list as written: `_raw_columns` (a compound's first select's), or
+    `_returning` for a write.
+    """
+    if isinstance(stmt, CompoundSelect):
+        return _raw(stmt.selects[0])
+    raw = getattr(stmt, "_raw_columns", None)
+    if raw is None:
+        raw = getattr(stmt, "_returning", ()) or ()
+    return raw
 
 
 def _entity_starts(stmt: Any) -> set[int]:
