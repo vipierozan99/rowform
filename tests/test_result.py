@@ -99,6 +99,16 @@ class TestOneScalarColumn:
             assert (await conn.scalars(null)).one() is None
             assert await (await conn.stream(null)).one() == (None,)
 
+    async def test_a_null_among_values_is_still_a_row(self, engine):
+        """Values with no NULL keep the scalar fast path; a batch with one does not."""
+        mixed = sa.select(
+            sa.case((Author.id == 2, sa.null()), else_=Author.name).label("maybe")
+        ).order_by(Author.id)
+        async with engine.connect() as conn:
+            assert (await conn.execute(mixed)).scalars().all() == ["ada", None, "carol", "dan"]
+            assert (await conn.execute(mixed.where(Author.id >= 2))).first() == (None,)
+            assert (await conn.execute(mixed.where(Author.id == 1))).scalar_one() == "ada"
+
 
 class TestOneOuterJoinedEntity:
     async def test_no_match_is_a_row_holding_none(self, engine):

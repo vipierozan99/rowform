@@ -100,9 +100,9 @@ class _NoRows(_Result):
 
 
 def _scalar_source(plan: Plan) -> bool:
-    """Whether each hydrated item can stand in for its row. `IteratorResult` reads a
-    bare `None` from a scalar source as "no more rows", so a lone slot that can
-    hydrate to `None` (a column, or an outer-joined model) goes in a 1-tuple instead.
+    """Whether each hydrated item can always stand in for its row. `IteratorResult`
+    reads a bare `None` from a scalar source as "no more rows", so a lone slot that
+    can hydrate to `None` (a column, or an outer-joined model) may not.
     """
     if plan.wrap:
         return False
@@ -117,11 +117,14 @@ def _as_rows(plan: Plan, hydrated: list[Any]) -> list[Any]:
 
 
 def result_for(plan: Plan, metadata: Any, hydrated: list[Any]) -> _Result:
+    # A lone slot that could be `None` but is not in this batch keeps the scalar
+    # source, so `.scalars()` builds no `Row`; `None in` is a C-level scan.
+    scalars = not plan.wrap and (_scalar_source(plan) or None not in hydrated)
     return _Result(
         metadata,
-        iter(_as_rows(plan, hydrated)),
+        iter(hydrated if plan.wrap or scalars else [(item,) for item in hydrated]),
         len(hydrated),
-        _source_supports_scalars=_scalar_source(plan),
+        _source_supports_scalars=scalars,
     )
 
 
