@@ -256,6 +256,17 @@ async def scopes() -> None:
 # --- schema surface --------------------------------------------------------
 assert_type(Base.metadata, sa.MetaData)
 assert_type(Author.__table__, sa.Table)
+
+
+class ActiveAuthor(Base):
+    # No `ClassVar[...]` annotation needed: a view is a `sa.Table`.
+    __table__ = rf.view("active_authors", Base.metadata, sa.select(Author.id, Author.name))
+    id: Mapped[int]
+    name: Mapped[str]
+
+
+assert_type(rf.view("v", sa.MetaData(), sa.select(Author.id)), rf.View)
+assert_type(rf.views(Base.metadata), dict[str, rf.View])
 assert_type(Author.__tablename__, str)
 assert_type(Author.__column_order__, tuple[str, ...])
 

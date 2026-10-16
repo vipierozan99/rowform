@@ -85,17 +85,15 @@ def _match_model(
     if index + width > len(columns):
         return None
 
-    # An alias proxies the table's columns, so resolve through the selected from clause.
+    # By key, in the selected order: an alias proxies the table's columns under the
+    # same keys, and a model over a view may declare its fields in another order.
+    attr_for = {column.key: attr for attr, column in declared.items()}
     pairs = []
-    for attr, column in declared.items():
-        try:
-            resolved = from_clause.columns[column.key]
-        except KeyError:
+    for column in columns[index : index + width]:
+        attr = attr_for.pop(column.key, None)
+        if attr is None or from_clause.columns.get(column.key) is not column:
             return None
-        pairs.append((attr, resolved))
-
-    if any(columns[index + offset] is not col for offset, (_, col) in enumerate(pairs)):
-        return None
+        pairs.append((attr, column))
 
     return ("model", model, pairs, id(from_clause) in nullable_froms), width
 

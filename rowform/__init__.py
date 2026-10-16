@@ -32,6 +32,7 @@ from .errors import (
 from .model import DEFAULT_TYPE_MAP, Base, ModelMeta, alias, mapped_column, model_for
 from .planner import Plan, plan
 from .query import CoreQuery
+from .view import CreateView, DropView, View, view, views
 
 #: Read by [tool.hatch.version] in pyproject.toml.
 __version__ = "0.1.0"
@@ -42,8 +43,10 @@ __all__ = [
     "ConfigurationError",
     "Connection",
     "CoreQuery",
+    "CreateView",
     "DeclarationError",
     "Driver",
+    "DropView",
     "Engine",
     "EngineStateError",
     "ModelMeta",
@@ -53,6 +56,7 @@ __all__ = [
     "RowformError",
     "StatementError",
     "UnsupportedError",
+    "View",
     "__version__",
     "active_connection",
     "alias",
@@ -62,4 +66,6 @@ __all__ = [
     "model_for",
     "plan",
     "result_processor",
+    "view",
+    "views",
 ]
