@@ -376,3 +376,38 @@ class TestBothTracksAgree:
             hot = await conn.fetch_all(statement)
             compat = (await conn.execute(statement)).tuples().all()
         assert hot == compat
+
+
+class TestKeysMatchCore:
+    """`Result.keys()` are the names Core gives: the compiler's result columns,
+    so a repeated name is deduplicated and an unnamed expression is `anon_1`.
+    """
+
+    STATEMENTS = {
+        "repeated": sa.select(Author.id, Book.id).join(Book),
+        "count": sa.select(sa.func.count(Author.id)),
+        "cast": sa.select(sa.cast(Author.id, sa.String)),
+        "literal": sa.select(sa.literal(1)),
+        "exists": sa.select(sa.exists().where(Author.id == 1)),
+        "distinct": sa.select(sa.distinct(Author.id)),
+        "label": sa.select(Author.id.label("x")),
+        "returning": sa.update(Author.__table__)
+        .where(Author.id == 1)
+        .values(name="ada")
+        .returning(Author.id, sa.func.lower(Author.name)),
+    }
+
+    @pytest.mark.parametrize("name", list(STATEMENTS))
+    async def test_keys_equal_cores(self, engine, name):
+        statement = self.STATEMENTS[name]
+        async with engine.sa_engine.connect() as core:
+            expected = list((await core.execute(statement)).keys())
+            await core.rollback()
+        async with engine.connect() as conn:
+            assert list((await conn.execute(statement)).keys()) == expected
+
+    async def test_an_entity_keeps_its_class_name(self, engine):
+        """Core has no entity; rowform names it as the ORM does."""
+        async with engine.connect() as conn:
+            result = await conn.execute(sa.select(Author, Book.id).join(Book))
+        assert list(result.keys()) == ["Author", "id"]

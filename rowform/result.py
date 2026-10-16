@@ -22,17 +22,30 @@ from sqlalchemy.util import await_only
 from .planner import Plan
 
 
-def keys_for(plan: Plan) -> list[str]:
-    """Column labels for one statement's rows: a model by its class name, a scalar by
-    its column key, as the ORM does. Duplicates are left to SQLAlchemy to report.
+def keys_for(plan: Plan, compiled: Any) -> list[str]:
+    """Column labels for one statement's rows: a model by its class name, as the ORM
+    does; a scalar by the name Core gives it, the compiler's result column (`id_1`
+    for a repeated `id`, `anon_1` for an unnamed expression). `_result_columns` is
+    SQLAlchemy-private. A bare `text()` has no compiled name; it is keyed by its text.
     """
+    names = [column.keyname for column in compiled._result_columns]
+    if len(names) != len(plan.columns):
+        names = [None] * len(plan.columns)
     keys: list[str] = []
+    offset = 0
     for entity in plan.entities:
         if entity[0] == "model":
             keys.append(entity[1].__name__)
-        else:
-            column = entity[1]
-            keys.append(getattr(column, "key", None) or getattr(column, "name", None) or str(column))
+            offset += len(entity[2])
+            continue
+        name = names[offset] or str(entity[1])
+        # The compiler deduplicates against a model's columns too, which the row
+        # does not show: `select(Author, Book.id)` keeps `id`, as the ORM does.
+        own = getattr(entity[1], "key", None)
+        if own and name != own and name.startswith(f"{own}_") and own not in keys:
+            name = own
+        keys.append(name)
+        offset += 1
     return keys
 
 
