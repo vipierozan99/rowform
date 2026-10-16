@@ -83,7 +83,9 @@ class CoreQuery(Generic[R]):
 
             if self._plan is None:
                 raise PlanError("this statement returns no rows; it has no result metadata")
-            metadata = self._metadata = SimpleResultMetaData(keys_for(self._plan))
+            metadata = self._metadata = SimpleResultMetaData(
+                keys_for(self._plan, self._compiled)
+            )
         return metadata
 
     @property
