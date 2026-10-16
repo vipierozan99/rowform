@@ -183,6 +183,28 @@ first = rf.alias(User, of=(
 ))
 ```
 
+## Views
+
+A model can sit on a view: declare the view with `rf.view()` and assign it to
+`__table__`. Every column of the select needs a field; types come from the select.
+
+```python
+ACTIVE = sa.select(User.id, User.name).where(User.active)
+
+class ActiveUser(Base):
+    __table__ = rf.view("active_users", Base.metadata, ACTIVE)
+    id: Mapped[int]
+    name: Mapped[str]
+
+await db.create_all(Base.metadata)      # tables, then views
+rows = await db.fetch_all(sa.select(ActiveUser))    # list[ActiveUser]
+```
+
+In a migration, emit the same DDL: `op.execute(rf.CreateView(ActiveUser.__table__))`
+and `op.execute(rf.DropView(ActiveUser.__table__))`. Caveat: `drop_all` drops views
+without `CASCADE`, so a database object rowform does not know about that depends on
+one makes the drop fail rather than vanish.
+
 ## Writing
 
 The model stands in for its table; `execute()` returns SQLAlchemy's `Result`.
@@ -213,6 +235,9 @@ the driver's own exception is `.orig` (asyncpg's, one `__cause__` below).
 from myapp.models import Base
 target_metadata = Base.metadata
 ```
+
+Views declared with `rf.view()` are not in `metadata.tables`, so autogenerate
+leaves them alone; create and drop them with `rf.CreateView`/`rf.DropView`.
 
 Caveat: column order is inherited-first and Alembic does not diff order, so
 adding a mixin to an existing table silently reorders `CREATE TABLE`. Pin it:
