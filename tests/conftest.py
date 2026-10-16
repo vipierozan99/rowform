@@ -235,7 +235,7 @@ async def engine_at(url: str, **kwargs):
     and connection options go to `create_async_engine`, rowform's own
     (`observer`, `cache_size`) to `rf.Engine`.
     """
-    ours = {k: kwargs.pop(k) for k in ("observer", "cache_size") if k in kwargs}
+    ours = {k: kwargs.pop(k) for k in ("observer", "around", "cache_size") if k in kwargs}
     sa_engine = create_async_engine(url, **kwargs)
     try:
         yield rf.Engine(sa_engine, **ours)

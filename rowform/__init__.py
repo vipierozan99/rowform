@@ -19,7 +19,7 @@
 from .compile import compile_hydrator, result_processor
 from .connection import Connection, active_connection
 from .drivers import Driver, driver_for
-from .engine import Engine, Observer
+from .engine import Around, Engine, Observer
 from .errors import (
     ConfigurationError,
     DeclarationError,
@@ -39,6 +39,7 @@ __version__ = "0.1.0"
 
 __all__ = [
     "DEFAULT_TYPE_MAP",
+    "Around",
     "Base",
     "ConfigurationError",
     "Connection",

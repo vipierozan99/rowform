@@ -12,9 +12,11 @@ nothing per row.
 
 from __future__ import annotations
 
+import contextvars
 import logging
-from contextlib import aclosing
+from contextlib import aclosing, contextmanager
 
+import pytest
 import sqlalchemy as sa
 from conftest import Author, seed, sqlite_db
 
@@ -150,6 +152,81 @@ class TestObserver:
             await engine.fetch_all(sa.select(Author))
 
         assert any("slow query" in record.message for record in caplog.records)
+
+
+_CURRENT: contextvars.ContextVar[str | None] = contextvars.ContextVar("span", default=None)
+
+
+class Spans:
+    """A stand-in tracer: what OpenTelemetry's `start_as_current_span` does to the
+    context, plus a record of what each span saw."""
+
+    def __init__(self):
+        self.spans: list[dict] = []
+
+    @contextmanager
+    def __call__(self, sql: str):
+        span = {"sql": sql, "error": None}
+        self.spans.append(span)
+        token = _CURRENT.set(sql)
+        try:
+            yield span
+        except BaseException as err:
+            span["error"] = err
+            raise
+        finally:
+            _CURRENT.reset(token)
+
+
+class TestAround:
+    async def test_every_round_trip_gets_a_span(self, engine):
+        spans = Spans()
+        engine.around = spans
+        await engine.fetch_all(sa.select(Author))
+        await engine.execute(sa.insert(Author.__table__).values(id=7301, name="a", active=True))
+        await engine.execute_many(
+            sa.insert(Author.__table__),
+            [{"id": 7302, "name": "b", "active": True}, {"id": 7303, "name": "c", "active": True}],
+        )
+        async with engine.begin() as conn:
+            await conn.execute(sa.delete(Author.__table__).where(Author.id > 7300))
+        assert [s["sql"].split()[0] for s in spans.spans] == ["SELECT", "INSERT", "INSERT", "DELETE"]
+        assert _CURRENT.get() is None
+
+    async def test_a_failed_statement_is_seen_by_the_span(self, engine):
+        spans = Spans()
+        engine.around = spans
+        with pytest.raises(sa.exc.IntegrityError):
+            await engine.execute(sa.insert(Author.__table__).values(id=1, name="dup", active=True))
+        assert isinstance(spans.spans[-1]["error"], sa.exc.IntegrityError)
+
+    async def test_a_stream_is_never_in_a_span_while_the_consumer_runs(self, engine):
+        """Held across a yield, the span would be current for the caller's own work."""
+        spans = Spans()
+        engine.around = spans
+        outside: list[str | None] = []
+        statement = sa.select(Author).order_by(Author.id)
+        async with engine.connect() as conn, aclosing(conn.fetch_iter(statement, chunk=2)) as rows:
+            async for _ in rows:
+                outside.append(_CURRENT.get())
+        assert outside == [None] * 4
+        assert len(spans.spans) >= 2, "one span per chunk round trip"
+
+    async def test_the_execute_stream_is_spanned_per_chunk_too(self, engine):
+        spans = Spans()
+        engine.around = spans
+        async with engine.connect() as conn:
+            result = await conn.stream(sa.select(Author.name).order_by(Author.id), chunk=2)
+            names = [row[0] async for row in result]
+        assert names == ["ada", "brian", "carol", "dan"]
+        assert len(spans.spans) >= 2
+
+    async def test_it_can_be_passed_to_the_constructor(self, sqlite_path):
+        spans = Spans()
+        async with sqlite_db(sqlite_path, around=spans) as db:
+            await seed(db)
+            await db.fetch_all(sa.select(Author))
+        assert any(s["sql"].startswith("SELECT") for s in spans.spans)
 
 
 class TestLogging:
