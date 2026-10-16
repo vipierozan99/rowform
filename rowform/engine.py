@@ -609,7 +609,11 @@ class Engine:
                     conn._exit()
 
     async def _resolve(self, target: Any) -> AsyncConnection:
-        """The `AsyncConnection` behind an `AsyncConnection` or an `AsyncSession`."""
+        """The `AsyncConnection` behind an `AsyncConnection` or an `AsyncSession`.
+
+        A session binding tables or classes to several engines has no one connection:
+        it is asked for the one to this engine, in its transaction.
+        """
         if isinstance(target, AsyncConnection):
             conn = target
         else:
@@ -619,7 +623,11 @@ class Engine:
                     f"bind= takes an AsyncConnection or an AsyncSession, got "
                     f"{type(target).__name__}"
                 )
-            conn = await connection()
+            binds = getattr(target, "binds", None)
+            if binds:
+                conn = await connection(bind_arguments={"bind": self._bind_in(target, binds)})
+            else:
+                conn = await connection()
         driver = conn.engine.dialect.driver
         if driver != self.dialect.driver:
             raise ConfigurationError(
@@ -628,6 +636,22 @@ class Engine:
                 f"an rf.Engine wrapping that connection's own engine."
             )
         return conn
+
+    def _bind_in(self, session: Any, binds: dict[Any, Any]) -> Any:
+        """The session's own bind for this engine: an engine, or a connection it was
+        given, as SQLAlchemy's sync session takes it."""
+        mine = self.sa_engine.sync_engine
+        for bind in [getattr(session.sync_session, "bind", None), *binds.values()]:
+            if bind is None:
+                continue
+            sync = bind.sync_connection if isinstance(bind, AsyncConnection) else bind
+            sync = getattr(sync, "sync_engine", sync)
+            if getattr(sync, "engine", sync) is mine:
+                return sync
+        raise ConfigurationError(
+            f"that session is not bound to this rf.Engine's engine ({self.sa_engine.url!r}); "
+            f"wrap the engine the session binds these tables to"
+        )
 
     @staticmethod
     async def _driver_connection(conn: AsyncConnection) -> Any:
