@@ -91,6 +91,27 @@ async with Session() as session, session.begin():
 Caveat: an unflushed `add()` is not in the database, and rowform never triggers
 autoflush.
 
+A session that routes tables to several engines (`binds=`) works the same way:
+wrap each engine once, and each `rf.Engine` joins the session on its own
+engine's connection.
+
+## Tracing
+
+`around=` wraps each driver round trip, which is where a span belongs:
+
+```python
+from opentelemetry import trace
+
+tracer = trace.get_tracer("rowform")
+
+db = rf.Engine(sa_engine, around=lambda sql: tracer.start_as_current_span(
+    "db.query", attributes={"db.statement": sql}
+))
+```
+
+A streamed read opens one span per chunk, so the consumer's own spans never nest
+inside a database span.
+
 ## FastAPI
 
 One engine per process; return bytes, not a pydantic `response_model`, which
