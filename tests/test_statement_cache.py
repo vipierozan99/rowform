@@ -112,10 +112,10 @@ class TestResolveOnce:
         calls = 0
         original = db._query_for
 
-        def counting(statement):
+        def counting(statement, params=None):
             nonlocal calls
             calls += 1
-            return original(statement)
+            return original(statement, params)
 
         monkeypatch.setattr(db, "_query_for", counting)
         await db.execute(

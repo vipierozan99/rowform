@@ -405,6 +405,7 @@ STAMPED = sa.Table(
     sa.Column("name", sa.String),
     sa.Column("version", sa.Integer, default=1, onupdate=lambda: 2),
     sa.Column("doubled", sa.Integer, default=lambda ctx: ctx.get_current_parameters()["id"] * 2),
+    sa.Column("note", sa.String, server_default="none"),
 )
 
 
@@ -433,6 +434,38 @@ class TestColumnDefaults:
         await stamped.execute(sa.insert(STAMPED).values(id=2, name="b"), {"doubled": 0})
         rows = (await stamped.execute(sa.select(STAMPED).order_by(STAMPED.c.id))).all()
         assert [(r.version, r.doubled) for r in rows] == [(5, 2), (1, 0)]
+
+    async def test_parameters_that_omit_a_column_get_its_default(self, stamped):
+        """Core compiles `insert(table)` with the caller's keys; so does rowform, once
+        per key set, so an omitted column is defaulted, or left to the server."""
+        await stamped.execute(sa.insert(STAMPED), {"id": 1, "name": "a"})
+        await stamped.execute_many(
+            sa.insert(STAMPED), [{"id": 2, "name": "b"}, {"id": 3, "name": "c"}]
+        )
+        await stamped.execute_many(sa.insert(STAMPED), [{"id": 4, "name": "d", "version": 9}])
+        rows = (await stamped.execute(sa.select(STAMPED).order_by(STAMPED.c.id))).all()
+        assert [(r.version, r.doubled, r.note) for r in rows] == [
+            (1, 2, "none"),
+            (1, 4, "none"),
+            (1, 6, "none"),
+            (9, 8, "none"),
+        ]
+
+    async def test_one_compile_per_key_set(self, stamped):
+        before = stamped.cached_statements
+        for i in range(3):
+            await stamped.execute(sa.insert(STAMPED), {"id": i, "name": "a"})
+        await stamped.execute(sa.insert(STAMPED), {"id": 9, "name": "a", "version": 2})
+        for i in range(3):
+            await stamped.fetch_all(sa.select(STAMPED).where(STAMPED.c.id == i))
+        assert stamped.cached_statements - before == 3
+
+    async def test_an_update_by_parameters_gets_its_onupdate(self, stamped):
+        await stamped.execute(sa.insert(STAMPED).values(id=1, name="a"))
+        stmt = sa.update(STAMPED).where(STAMPED.c.id == sa.bindparam("key")).returning(STAMPED)
+        async with stamped.begin() as conn:
+            (row,) = (await conn.execute(stmt, {"key": 1, "name": "b"})).all()
+        assert (row.name, row.version) == ("b", 2)
 
     async def test_an_update_gets_its_onupdate(self, stamped):
         await stamped.execute(sa.insert(STAMPED).values(id=1, name="a"))

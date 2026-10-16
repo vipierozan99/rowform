@@ -40,19 +40,25 @@ class CoreQuery(Generic[R]):
         "sql",
     )
 
-    def __init__(self, statement: Any, dialect: Any):
+    def __init__(
+        self, statement: Any, dialect: Any, column_keys: tuple[str, ...] | None = None
+    ):
         #: Kept so an engine can refuse a `CoreQuery` compiled for another driver.
         self.dialect = dialect
         # Compiled *with* the cache key, or `bind()` could not substitute another
-        # statement's literals (`extracted_parameters`).
+        # statement's literals (`extracted_parameters`). `column_keys`, as Core
+        # passes them, limit an INSERT/UPDATE to the columns the caller supplies.
         cache_key = statement._generate_cache_key()
         # The engine's `enable_from_linting`, as Core's execute applies it: a
         # cartesian product warns once per compiled shape.
         linting = dialect.compiler_linting | compiler.WARN_LINTING
+        keys = list(column_keys) if column_keys is not None else None
         compiled = self._compiled = (
-            statement.compile(dialect=dialect, cache_key=cache_key, linting=linting)
+            statement.compile(
+                dialect=dialect, cache_key=cache_key, column_keys=keys, linting=linting
+            )
             if cache_key is not None
-            else statement.compile(dialect=dialect, linting=linting)
+            else statement.compile(dialect=dialect, column_keys=keys, linting=linting)
         )
         # For an expanding statement this holds a POSTCOMPILE placeholder; `bind()`
         # returns the executable string.
