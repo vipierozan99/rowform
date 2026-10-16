@@ -412,14 +412,19 @@ def _fields_over(name: str, specs: dict[str, _Spec], selectable: Any) -> dict[st
     for field_name, spec in specs.items():
         marker = spec.marker
         own = marker.column
-        if set(marker.kwargs) - {"default"} or not own.type._isnull or own.foreign_keys:
+        if set(marker.kwargs) - {"default", "name"} or not own.type._isnull or own.foreign_keys:
             raise DeclarationError(
                 f"{name}.{field_name}: a model over a selectable takes its columns from "
                 f"__table__; mapped_column() may only rename the field or set "
                 f"default/default_factory/init"
             )
+        # A rename gives the SQL name; a selectable keys a renamed column by its key.
         key = own.name or field_name
-        column = available.get(key)
+        column = (
+            next((c for c in available if c.name == own.name), None)
+            if own.name
+            else available.get(field_name)
+        )
         if column is None:
             raise DeclarationError(
                 f"{name}.{field_name}: __table__ has no column {key!r}; it has "

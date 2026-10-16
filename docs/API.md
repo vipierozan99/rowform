@@ -26,8 +26,8 @@ Every concrete model has `__table__`, `__tablename__` and `__column_order__`
 Setting `__table__` in the class body instead declares a model over rows something
 else defines: an [`rf.view()`](#rfviewname-metadata-select--schemanone---rfview),
 a subquery or a CTE. No table is built; each field maps to the selectable's column
-of the same name (or the name a leading `mapped_column()` string gives), whose type
-it takes, so annotations such as `Mapped[None]` or `Mapped[Literal["x"]]` are fine.
+keyed by the field name (or, renamed with a leading `mapped_column()` string or
+`name=`, the column of that SQL name), whose type it takes, so annotations such as `Mapped[None]` or `Mapped[Literal["x"]]` are fine.
 Every column must be declared, in any order — `select(Model)` returns all of them —
 and `mapped_column()` may only rename or set `default`/`default_factory`/`init`.
 
