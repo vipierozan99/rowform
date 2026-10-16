@@ -112,7 +112,7 @@ literals inlined; `DROP VIEW IF EXISTS`, no `CASCADE`.
 
 ```python
 class Engine:
-    def __init__(self, engine: AsyncEngine, *, observer: Observer | None = None, cache_size: int | None = 500): ...
+    def __init__(self, engine: AsyncEngine, *, observer: Observer | None = None, around: Around | None = None, cache_size: int | None = 500): ...
 ```
 
 Wraps a SQLAlchemy `AsyncEngine` — never opens, pools or disposes one. The driver
@@ -127,7 +127,7 @@ changes transaction behaviour for every user of that `AsyncEngine`, not only
 rowform.
 
 Attributes: `sa_engine`, `dialect` (the engine's own, `initialize()`d), `driver`,
-`observer` (reassignable), `cached_statements`.
+`observer` and `around` (both reassignable), `cached_statements`.
 
 ### One-shot reads
 
@@ -223,7 +223,10 @@ leaving without `commit()` rolls back.
 `bind=` runs on an `AsyncConnection` or `AsyncSession` somebody else owns:
 statements see that transaction's uncommitted writes and roll back with it, and
 rowform neither begins nor ends anything. Flush the session first — rowform reads
-the connection under it, so a pending `add()` is invisible. `execution_options`
+the connection under it, so a pending `add()` is invisible. A session with
+`binds=` hands over its connection to *this* engine (the one `rf.Engine` wraps),
+so one session can serve an `rf.Engine` per database; a session bound nowhere to
+this engine is a `ConfigurationError`. `execution_options`
 with `bind=` and a connection from another driver are both `ConfigurationError`.
 
 #### `async with engine.begin(**execution_options) as conn:`
@@ -318,6 +321,18 @@ Called after every statement with the SQL, the driver round-trip in seconds, and
 the row count (`None` when none are returned; for `fetch_iter`, once with the
 total). Exceptions propagate. `logging.getLogger("rowform")` logs each compile
 and each hydrator build (with source) at DEBUG.
+
+## `rf.Around`
+
+```python
+Around = Callable[[str], AbstractContextManager[Any]]
+```
+
+Called with the SQL (for `copy_in`, `COPY table (columns)`) before every driver
+round trip. The context manager is entered as the statement goes out and exited
+when the driver answers or raises, seeing the exception. A stream enters it once per chunk fetched, never across a
+`yield`, so a contextvar-based span (OpenTelemetry) is not left current while
+the consumer's code runs. Rows are hydrated outside it.
 
 ## Errors
 

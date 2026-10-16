@@ -12,7 +12,7 @@ import asyncio
 import logging
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable, Sequence
-from contextlib import asynccontextmanager
+from contextlib import AbstractContextManager, asynccontextmanager, nullcontext
 from time import perf_counter
 from typing import Any, TypeVar, overload
 
@@ -38,6 +38,13 @@ _LOG = logging.getLogger("rowform")
 #: count (`None` for a statement that returns none).
 Observer = Callable[[str, float, "int | None"], None]
 
+#: Called with the SQL of every driver round trip; the context manager it returns is
+#: entered before the statement goes out and exited when the driver answers or
+#: raises (a stream: once per chunk). For a tracing span; never held across a yield.
+Around = Callable[[str], AbstractContextManager[Any]]
+
+_NO_AROUND = nullcontext()
+
 
 #: Compiled statements kept (LRU). SQLAlchemy's `compiled_cache` default, for the
 #: same reason: statements built per request would otherwise accumulate forever.
@@ -58,6 +65,7 @@ class Engine:
         engine: AsyncEngine,
         *,
         observer: Observer | None = None,
+        around: Around | None = None,
         cache_size: int | None = DEFAULT_CACHE_SIZE,
     ):
         if cache_size is not None and cache_size < 1:
@@ -77,6 +85,8 @@ class Engine:
         #: Reassignable at any time; `None` disables it. Exceptions it raises are
         #: not caught — it runs on the caller's path.
         self.observer = observer
+        #: Reassignable like `observer`; see `Around`.
+        self.around = around
         self._cache_size = cache_size
         self._queries: OrderedDict[Any, CoreQuery[Any]] = OrderedDict()
 
@@ -263,18 +273,13 @@ class Engine:
         total = 0
         try:
             async with acquire() as conn:
-                try:
-                    async for rows, description in self.driver.stream(
-                        conn, sql, bound, chunk, query
-                    ):
-                        hydrate = query._hydrate
-                        if hydrate is None:
-                            hydrate = query.hydrator(self.dialect, description)
-                        total += len(rows)
-                        for row in hydrate(rows):
-                            yield row
-                except self.driver.errors as err:
-                    raise self._wrap(err, sql, bound)
+                async for rows, description in self._stream(conn, sql, bound, chunk, query):
+                    hydrate = query._hydrate
+                    if hydrate is None:
+                        hydrate = query.hydrator(self.dialect, description)
+                    total += len(rows)
+                    for row in hydrate(rows):
+                        yield row
         finally:
             # One call per stream, rows actually delivered, consumer time included;
             # in `finally` so an abandoned iteration is still reported.
@@ -395,10 +400,13 @@ class Engine:
         observer = self.observer
         start = perf_counter() if observer is not None else 0.0
         label = f"COPY {table.name} ({', '.join(names)})"
-        try:
-            copied = await self.driver.copy_in(conn, table, [c.name for c in selected], records)
-        except self.driver.errors as err:
-            raise self._wrap(err, label, None)
+        with self._around(label):
+            try:
+                copied = await self.driver.copy_in(
+                    conn, table, [c.name for c in selected], records
+                )
+            except self.driver.errors as err:
+                raise self._wrap(err, label, None)
         self._observe(observer, label, start, copied)
         return copied
 
@@ -601,7 +609,11 @@ class Engine:
                     conn._exit()
 
     async def _resolve(self, target: Any) -> AsyncConnection:
-        """The `AsyncConnection` behind an `AsyncConnection` or an `AsyncSession`."""
+        """The `AsyncConnection` behind an `AsyncConnection` or an `AsyncSession`.
+
+        A session binding tables or classes to several engines has no one connection:
+        it is asked for the one to this engine, in its transaction.
+        """
         if isinstance(target, AsyncConnection):
             conn = target
         else:
@@ -611,7 +623,11 @@ class Engine:
                     f"bind= takes an AsyncConnection or an AsyncSession, got "
                     f"{type(target).__name__}"
                 )
-            conn = await connection()
+            binds = getattr(target, "binds", None)
+            if binds:
+                conn = await connection(bind_arguments={"bind": self._bind_in(target, binds)})
+            else:
+                conn = await connection()
         driver = conn.engine.dialect.driver
         if driver != self.dialect.driver:
             raise ConfigurationError(
@@ -620,6 +636,22 @@ class Engine:
                 f"an rf.Engine wrapping that connection's own engine."
             )
         return conn
+
+    def _bind_in(self, session: Any, binds: dict[Any, Any]) -> Any:
+        """The session's own bind for this engine: an engine, or a connection it was
+        given, as SQLAlchemy's sync session takes it."""
+        mine = self.sa_engine.sync_engine
+        for bind in [getattr(session.sync_session, "bind", None), *binds.values()]:
+            if bind is None:
+                continue
+            sync = bind.sync_connection if isinstance(bind, AsyncConnection) else bind
+            sync = getattr(sync, "sync_engine", sync)
+            if getattr(sync, "engine", sync) is mine:
+                return sync
+        raise ConfigurationError(
+            f"that session is not bound to this rf.Engine's engine ({self.sa_engine.url!r}); "
+            f"wrap the engine the session binds these tables to"
+        )
 
     @staticmethod
     async def _driver_connection(conn: AsyncConnection) -> Any:
@@ -664,10 +696,13 @@ class Engine:
         async with acquire() as conn:
             # Timed from here: the observer's contract is the driver round trip.
             start = perf_counter() if observer is not None else 0.0
-            try:
-                rows, description = await self.driver.fetch(conn, sql, bound, hydrate is None)
-            except self.driver.errors as err:
-                raise self._wrap(err, sql, bound)
+            with self._around(sql):
+                try:
+                    rows, description = await self.driver.fetch(
+                        conn, sql, bound, hydrate is None
+                    )
+                except self.driver.errors as err:
+                    raise self._wrap(err, sql, bound)
         if hydrate is None:
             hydrate = query.hydrator(self.dialect, description)
         self._observe(observer, sql, start, len(rows))
@@ -689,20 +724,36 @@ class Engine:
             start = perf_counter() if observer is not None else 0.0
             total = 0
             async with acquire() as conn:
-                try:
-                    async for rows, description in self.driver.stream(
-                        conn, sql, bound, wanted, query
-                    ):
-                        hydrate = query._hydrate
-                        if hydrate is None:
-                            hydrate = query.hydrator(self.dialect, description)
-                        total += len(rows)
-                        yield hydrate(rows)
-                except self.driver.errors as err:
-                    raise self._wrap(err, sql, bound)
+                async for rows, description in self._stream(conn, sql, bound, wanted, query):
+                    hydrate = query._hydrate
+                    if hydrate is None:
+                        hydrate = query.hydrator(self.dialect, description)
+                    total += len(rows)
+                    yield hydrate(rows)
             self._observe(observer, sql, start, total)
 
         return chunks
+
+    def _around(self, sql: str) -> AbstractContextManager[Any]:
+        around = self.around
+        return _NO_AROUND if around is None else around(sql)
+
+    async def _stream(
+        self, conn: Any, sql: str, bound: Any, chunk: int, query: CoreQuery[Any]
+    ) -> AsyncIterator[tuple[Any, Any]]:
+        """The driver's chunks, each fetch inside `around`: entering it once for the
+        whole stream would hold it across the consumer's code at every yield.
+        """
+        chunks = self.driver.stream(conn, sql, bound, chunk, query)
+        while True:
+            with self._around(sql):
+                try:
+                    batch = await anext(chunks)
+                except StopAsyncIteration:
+                    return
+                except self.driver.errors as err:
+                    raise self._wrap(err, sql, bound)
+            yield batch
 
     def _observe(self, observer: Observer | None, sql: str, start: float, rows: int | None) -> None:
         """Hand one completed statement to `observer`. Captured by the caller at start,
