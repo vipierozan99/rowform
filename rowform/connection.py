@@ -227,10 +227,11 @@ class Connection:
         await self._autobegin()
         observer = engine.observer
         start = perf_counter() if observer is not None else 0.0
-        try:
-            report = await engine.driver.execute(self.connection, sql, parameters)
-        except engine.driver.errors as err:
-            raise engine._wrap(err, sql, parameters)
+        with engine._around(sql):
+            try:
+                report = await engine.driver.execute(self.connection, sql, parameters)
+            except engine.driver.errors as err:
+                raise engine._wrap(err, sql, parameters)
         engine._observe(observer, sql, start, None)
         return _result.no_rows(report)
 
@@ -370,10 +371,11 @@ class Connection:
         observer = engine.observer
         start = perf_counter() if observer is not None else 0.0
         bound_sets = [bound for _, bound in shaped]
-        try:
-            report = await engine.driver.execute_many(self.connection, sql, bound_sets)
-        except engine.driver.errors as err:
-            raise engine._wrap(err, sql, bound_sets, multi=True)
+        with engine._around(sql):
+            try:
+                report = await engine.driver.execute_many(self.connection, sql, bound_sets)
+            except engine.driver.errors as err:
+                raise engine._wrap(err, sql, bound_sets, multi=True)
         engine._observe(observer, sql, start, None)
         return report
 
@@ -415,10 +417,11 @@ class Connection:
         sql, bound = query.bind(params, extracted)
         observer = engine.observer
         start = perf_counter() if observer is not None else 0.0
-        try:
-            report = await engine.driver.execute(self.connection, sql, bound)
-        except engine.driver.errors as err:
-            raise engine._wrap(err, sql, bound)
+        with engine._around(sql):
+            try:
+                report = await engine.driver.execute(self.connection, sql, bound)
+            except engine.driver.errors as err:
+                raise engine._wrap(err, sql, bound)
         engine._observe(observer, sql, start, None)
         return report
 

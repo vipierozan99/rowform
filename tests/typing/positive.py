@@ -11,6 +11,7 @@ be, erases every field type to `Any` and each `assert_type` below would fail.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import decimal
 import uuid
@@ -98,6 +99,8 @@ assert_type(sa.select(recent), sa.Select[tuple[Author]])
 
 # --- prepare() and fetch_all() preserve them -------------------------------
 engine = rf.Engine(create_async_engine("sqlite+aiosqlite:///app.db"))
+assert_type(engine.around, rf.Around | None)
+engine.around = lambda sql: contextlib.nullcontext()
 
 assert_type(engine.prepare(sa.select(Author)), rf.CoreQuery[Author])
 assert_type(engine.prepare(sa.select(Author.name)), rf.CoreQuery[str])
