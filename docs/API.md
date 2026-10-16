@@ -179,6 +179,14 @@ dict or a list of dicts (executemany), as `AsyncConnection.execute` takes it;
 `**params` merges into it. A statement with no result set gives a *closed*
 `Result` — `.rowcount` works, `.all()` raises `ResourceClosedError`.
 
+Writes get their columns' Python-side defaults as through Core: a column the
+statement leaves out gets its `default=` (an `UPDATE` its `onupdate=`), a scalar
+or a callable, which may take a context offering `get_current_parameters()`. An
+`INSERT`/`UPDATE` executed with parameters is compiled for those parameters' keys
+(an executemany's first set), once per key set, so a column they omit is defaulted
+or left to its `server_default` rather than sent as NULL; a later set lacking a key
+the first had is an error, as in Core.
+
 #### `await engine.scalar(...)` / `await engine.scalars(...)`
 
 `execute(...).scalar()` / `.scalars()`; the rows are buffered, so the result
@@ -252,7 +260,9 @@ exception is `.orig.__cause__`). Inside a pipeline the error has no `.statement`
 ### `engine.prepare(statement) -> CoreQuery`
 
 Compiles once for this engine's dialect. A bare statement is cached under
-SQLAlchemy's structural cache key anyway; this is convenience, not speed.
+SQLAlchemy's structural cache key anyway; this is convenience, not speed. It
+compiles without parameter keys, so a prepared `insert(table)` lists every column;
+pass a bare statement to have omitted columns defaulted.
 
 ## `rf.Connection`
 

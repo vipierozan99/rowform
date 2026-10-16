@@ -176,7 +176,13 @@ class Connection:
                 "each set is its own, so there is nothing for them to merge into. "
                 f"Put {', '.join(sorted(params))} in every dict instead."
             )
-        query, extracted = resolved if resolved is not None else engine._query_for(statement)
+        query, extracted = (
+            resolved
+            if resolved is not None
+            else engine._query_for(
+                statement, parameters if many else {**(parameters or {}), **params}
+            )
+        )
         if many:
             return _result.no_rows(await self._execute_many(query, extracted, parameters))
         bound = {**(parameters or {}), **params}
@@ -204,7 +210,7 @@ class Connection:
         engine = self._engine
         await self._autobegin()
         bound = {**(parameters or {}), **params}
-        query, extracted = engine._require_rows(statement)
+        query, extracted = engine._require_rows(statement, bound)
         plan = query.entities
         assert plan is not None  # _require_rows guarantees it
         chunks = engine._chunks(query, bound, extracted, chunk, self._pinned)
@@ -260,7 +266,7 @@ class Connection:
         """
         engine = self._engine
         await self._autobegin()
-        query, extracted = engine._require_rows(statement)
+        query, extracted = engine._require_rows(statement, params)
         rows, hydrate = await engine._run(query, params, self._pinned, extracted)
         return hydrate(rows)
 
@@ -340,7 +346,7 @@ class Connection:
     async def execute_many(self, statement: Any, params: Sequence[dict[str, Any]]) -> Any:
         """One compiled statement, many parameter sets, one round trip; the driver's own report."""
         await self._autobegin()
-        query, extracted = self._engine._query_for(statement)
+        query, extracted = self._engine._query_for(statement, params)
         return await self._execute_many(query, extracted, params)
 
     async def _execute_many(self, query: Any, extracted: Any, params: Sequence[dict[str, Any]]) -> Any:
