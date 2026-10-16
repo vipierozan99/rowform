@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 import sqlalchemy as sa
-from conftest import Author, Base, pg_url, sqlite_url
+from conftest import Author, Base, Book, pg_url, sqlite_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
@@ -157,6 +157,45 @@ class TestOnASession:
                 assert len(await conn.fetch_all(sa.select(Author))) == 2
             await session.rollback()
         assert [a.name for a in await db.fetch_all(sa.select(Author))] == ["ada"]
+
+
+class TestOnASessionWithSeveralEngines:
+    """A session binding tables to different engines has no single connection;
+    each rf.Engine joins the session through the connection for its own engine."""
+
+    @staticmethod
+    def sessions(sa_engine, other):
+        return async_sessionmaker(binds={Author.__table__: sa_engine, Book.__table__: other})
+
+    async def test_it_joins_through_its_own_engine(self, pair):
+        db, sa_engine = pair
+        other = create_async_engine(sa_engine.url)
+        try:
+            async with self.sessions(sa_engine, other)() as session, session.begin():
+                await session.execute(
+                    sa.insert(Author.__table__).values(id=5, name="eve", active=True)
+                )
+                async with db.connect(bind=session) as conn:
+                    names = await conn.fetch_all(sa.select(Author.name).order_by(Author.id))
+                    mine = conn.sa_connection.sync_connection
+                async with rf.Engine(other).connect(bind=session) as conn:
+                    theirs = conn.sa_connection.sync_connection
+                assert names == ["ada", "eve"], "the session's uncommitted write"
+                assert mine is not theirs
+        finally:
+            await other.dispose()
+
+    async def test_an_engine_the_session_is_not_bound_to_is_refused(self, pair):
+        _, sa_engine = pair
+        other, stranger = create_async_engine(sa_engine.url), create_async_engine(sa_engine.url)
+        try:
+            async with self.sessions(sa_engine, other)() as session, session.begin():
+                with pytest.raises(rf.ConfigurationError, match="not bound to"):
+                    async with rf.Engine(stranger).connect(bind=session):
+                        pass
+        finally:
+            await other.dispose()
+            await stranger.dispose()
 
 
 class TestItWillNotEndSomebodyElsesTransaction:
