@@ -528,6 +528,26 @@ class TestModelOverASelectable:
 
         assert Defaulted(id=1, name="a").kind == "staff"
 
+    @pytest.mark.parametrize("rename", [("url_slug",), {"name": "url_slug"}], ids=["str", "name"])
+    def test_a_rename_matches_the_column_by_its_sql_name(self, rename):
+        """A table's renamed column keeps its key in a subquery; the rename names it."""
+        Scratch = make_base()
+        pages = sa.Table(
+            "pages",
+            Scratch.metadata,
+            sa.Column("id", sa.Integer, primary_key=True),
+            sa.Column("url_slug", sa.String, key="slug"),
+        )
+        recent = sa.select(pages).subquery("recent")
+        args, kwargs = (rename, {}) if isinstance(rename, tuple) else ((), rename)
+
+        class Recent(Scratch):
+            __table__ = recent
+            id: Mapped[int]
+            path: Mapped[str] = rf.mapped_column(*args, **kwargs)
+
+        assert Recent.path is recent.c.slug
+
 
 class TestMixinsAndOrder:
     def test_mixin_fields_are_inherited_as_real_columns(self):
