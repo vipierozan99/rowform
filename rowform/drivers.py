@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import itertools
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from functools import cached_property
 from typing import Any
@@ -79,7 +79,7 @@ class Driver(ABC):
     @abstractmethod
     def stream(
         self, conn: Any, sql: str, params: Any, chunk: int, query: CoreQuery[Any]
-    ) -> AsyncIterator[tuple[Any, Any]]:
+    ) -> AsyncGenerator[tuple[Any, Any], None]:
         """Yield `(rows, description)` per chunk, incrementally from the server."""
 
     @abstractmethod
