@@ -6,16 +6,23 @@ import dataclasses
 import datetime as dt
 import decimal
 import enum
+import typing
 import uuid
 from abc import ABC
 
 import pytest
 import sqlalchemy as sa
 from conftest import Author, Base, Book, Colour, Wide
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.sqlite import aiosqlite
 from sqlalchemy.orm import Mapped
 
 import rowform as rf
+
+# Module level: string annotations resolve against module globals.
+UserId = typing.NewType("UserId", uuid.UUID)
+PatientId = typing.NewType("PatientId", UserId)
+Slug = typing.NewType("Slug", str)
 
 
 def make_base():
@@ -89,10 +96,25 @@ class TestTableConstruction:
             id: Mapped[int] = rf.mapped_column(primary_key=True)
             title: Mapped[str] = rf.mapped_column("headline", index=True)
 
-        assert Renamed.__table__.c.keys() == ["id", "headline"]
+        # As in SQLAlchemy: the key stays the field name, only the SQL name changes,
+        # so `asdict(instance)` is a valid `insert().values(...)` mapping.
+        assert Renamed.__table__.c.keys() == ["id", "title"]
         assert Renamed.title.name == "headline"
-        # The attribute keeps the Python name; only the DB column is renamed.
         assert Renamed(id=1, title="t").title == "t"
+        assert Renamed.__table__.c.title is Renamed.title
+        compiled = sa.insert(Renamed).values(dataclasses.asdict(Renamed(id=1, title="t"))).compile()
+        assert "headline" in str(compiled)
+
+    def test_a_name_keyword_renames_the_column_too(self):
+        Scratch = make_base()
+
+        class Renamed(Scratch):
+            __tablename__ = "renamed"
+            id: Mapped[int] = rf.mapped_column(primary_key=True)
+            session_date: Mapped[dt.date] = rf.mapped_column(name="implant_session_date")
+
+        assert Renamed.__table__.c.keys() == ["id", "session_date"]
+        assert Renamed.session_date.name == "implant_session_date"
 
     def test_table_args_pass_through(self):
         Scratch = make_base()
@@ -120,6 +142,55 @@ class TestTableConstruction:
             body: Mapped[str]
 
         assert isinstance(Doc.__table__.c.body.type, sa.Text)
+
+    def test_a_type_class_in_the_map_is_instantiated(self):
+        """`{uuid.UUID: SmartUUID}` with no parentheses, as SQLAlchemy accepts."""
+
+        class Scratch(rf.Base):
+            metadata = sa.MetaData()
+            type_annotation_map = {str: sa.Text}
+
+        class Doc(Scratch):
+            __tablename__ = "doc"
+            id: Mapped[int] = rf.mapped_column(primary_key=True)
+            body: Mapped[str]
+            title: Mapped[str] = rf.mapped_column(unique=True)
+
+        assert isinstance(Doc.__table__.c.body.type, sa.Text)
+        assert isinstance(Doc.__table__.c.title.type, sa.Text)
+
+    def test_a_newtype_resolves_through_its_supertype(self):
+        """As SQLAlchemy does: the NewType itself first, then its flattened supertype."""
+
+        class Scratch(rf.Base):
+            metadata = sa.MetaData()
+            type_annotation_map = {Slug: sa.Text()}
+
+        class Person(Scratch):
+            __tablename__ = "person"
+            id: Mapped[PatientId] = rf.mapped_column(primary_key=True)
+            owner: Mapped[UserId | None]
+            slug: Mapped[Slug]
+
+        columns = Person.__table__.c
+        assert isinstance(columns.id.type, sa.Uuid)
+        assert isinstance(columns.owner.type, sa.Uuid)
+        assert columns.owner.nullable
+        assert isinstance(columns.slug.type, sa.Text)
+
+    def test_a_string_literal_is_a_non_native_enum(self):
+        """SQLAlchemy's mapping for `Literal["a", "b"]`."""
+        Scratch = make_base()
+
+        class Tagged(Scratch):
+            __tablename__ = "tagged"
+            id: Mapped[int] = rf.mapped_column(primary_key=True)
+            kind: Mapped[typing.Literal["a", "b"]]
+
+        kind = Tagged.__table__.c.kind.type
+        assert isinstance(kind, sa.Enum)
+        assert kind.enums == ["a", "b"]
+        assert not kind.native_enum
 
     def test_an_unmapped_python_type_is_refused_with_a_way_out(self):
         Scratch = make_base()
@@ -278,6 +349,206 @@ class TestInstances:
         assert not hasattr(instance, "id")
 
 
+class TestClassBodyReferences:
+    """A field declared with `rf.mapped_column()` is a column expression inside the
+    class body, so `__table_args__` can name it, as it can with the ORM's.
+    """
+
+    def test_constraints_take_the_field_itself(self):
+        Scratch = make_base()
+
+        class Account(Scratch):
+            __tablename__ = "account"
+            id: Mapped[int] = rf.mapped_column(primary_key=True)
+            username: Mapped[str] = rf.mapped_column()
+            org: Mapped[int] = rf.mapped_column()
+
+            __table_args__ = (
+                sa.UniqueConstraint(username, name="account_username_key"),
+                sa.Index("ix_account_org_username", org, username.desc()),
+            )
+
+        table = Account.__table__
+        unique = next(c for c in table.constraints if isinstance(c, sa.UniqueConstraint))
+        assert list(unique.columns) == [table.c.username]
+        index = next(iter(table.indexes))
+        assert index.expressions[0] is table.c.org
+
+    def test_expressions_render_with_the_resolved_types(self):
+        Scratch = make_base()
+
+        class Delivery(Scratch):
+            __tablename__ = "delivery"
+            id: Mapped[int] = rf.mapped_column(primary_key=True)
+            # Typed explicitly, as with the ORM: the body binds `Colour.RED` before
+            # the annotation is resolved, and an untyped literal cannot render.
+            colour: Mapped[Colour] = rf.mapped_column(sa.Enum(Colour))
+            sent_at: Mapped[dt.datetime | None] = rf.mapped_column()
+            deleted_at: Mapped[dt.datetime | None] = rf.mapped_column()
+
+            __table_args__ = (
+                sa.CheckConstraint(
+                    sa.or_(colour != Colour.RED, sent_at.is_not(None)), name="delivery_chk"
+                ),
+                sa.Index(
+                    "uq_delivery_live", id, unique=True, postgresql_where=deleted_at.is_(None)
+                ),
+            )
+
+        ddl = str(sa.schema.CreateTable(Delivery.__table__).compile(dialect=postgresql.dialect()))
+        assert "CHECK (colour != 'RED' OR sent_at IS NOT NULL)" in ddl
+        index = str(
+            sa.schema.CreateIndex(next(iter(Delivery.__table__.indexes))).compile(
+                dialect=postgresql.dialect()
+            )
+        )
+        assert "WHERE deleted_at IS NULL" in index
+        assert Delivery.__table__.c.sent_at.nullable
+        assert not Delivery.__table__.c.colour.nullable
+
+    def test_a_referenced_column_binds_with_its_resolved_type(self):
+        """The type is resolved after the class body ran; a comparison built later
+        must not keep the untyped comparator the body used.
+        """
+        Scratch = make_base()
+
+        class Ticket(Scratch):
+            __tablename__ = "ticket"
+            id: Mapped[uuid.UUID] = rf.mapped_column(primary_key=True)
+            __table_args__ = (sa.Index("ix_ticket_id", id.desc()),)
+
+        assert isinstance((Ticket.id == uuid.uuid4()).right.type, sa.Uuid)
+
+    def test_a_mixin_foreign_key_serves_every_model_below_it(self):
+        Scratch = make_base()
+
+        class Org(Scratch):
+            __tablename__ = "org"
+            id: Mapped[int] = rf.mapped_column(primary_key=True)
+
+        class Owned(Scratch):
+            org_id: Mapped[int] = rf.mapped_column(sa.ForeignKey("org.id"))
+
+        class Project(Owned):
+            __tablename__ = "project"
+            id: Mapped[int] = rf.mapped_column(primary_key=True)
+
+        class Team(Owned):
+            __tablename__ = "team"
+            id: Mapped[int] = rf.mapped_column(primary_key=True)
+
+        for model in (Project, Team):
+            (fk,) = model.__table__.c.org_id.foreign_keys
+            assert fk.column is Org.__table__.c.id
+
+
+class TestModelOverASelectable:
+    """`__table__ = <FromClause>`: a model over rows something else defines (a view,
+    a subquery). Types come from the selectable, so the annotations only shape the
+    dataclass.
+    """
+
+    @staticmethod
+    def view():
+        return sa.table(
+            "active_people",
+            sa.column("id", sa.Integer),
+            sa.column("name", sa.String),
+            sa.column("kind", sa.String),
+        )
+
+    def test_it_maps_the_given_columns_in_any_order(self):
+        view = self.view()
+        Scratch = make_base()
+
+        class ActivePerson(Scratch):
+            __tablename__ = "active_people"
+            __table__ = view
+            name: Mapped[str]
+            kind: Mapped[typing.Literal["staff"]]
+            id: Mapped[int]
+
+        assert ActivePerson.__table__ is view
+        assert ActivePerson.id is view.c.id
+        assert rf.model_for(view) is ActivePerson
+        assert Scratch.metadata.tables == {}, "no Table of its own"
+        assert ActivePerson(name="a", kind="staff", id=1).id == 1
+        (entity,) = rf.plan(sa.select(ActivePerson)).entities
+        assert entity[0] == "model" and entity[1] is ActivePerson
+
+    def test_annotations_need_no_column_type(self):
+        """A discriminated view types a column `None` or a `Literal`; neither maps
+        to a column type, and neither has to."""
+        Scratch = make_base()
+
+        class Unset(Scratch):
+            __table__ = self.view()
+            id: Mapped[int]
+            name: Mapped[None]
+            kind: Mapped[typing.Literal["staff"]]
+
+        assert isinstance(Unset.name.type, sa.String)
+
+    def test_a_column_left_undeclared_is_refused(self):
+        Scratch = make_base()
+        with pytest.raises(TypeError, match=r"does not declare \['kind'\]"):
+
+            class Partial(Scratch):
+                __table__ = self.view()
+                id: Mapped[int]
+                name: Mapped[str]
+
+    def test_a_field_the_selectable_lacks_is_refused(self):
+        Scratch = make_base()
+        with pytest.raises(TypeError, match=r"has no column 'email'"):
+
+            class Extra(Scratch):
+                __table__ = self.view()
+                id: Mapped[int]
+                name: Mapped[str]
+                kind: Mapped[str]
+                email: Mapped[str]
+
+    def test_column_options_are_refused(self):
+        """The selectable owns its columns; only the dataclass options apply."""
+        Scratch = make_base()
+        with pytest.raises(TypeError, match="takes its columns from __table__"):
+
+            class Keyed(Scratch):
+                __table__ = self.view()
+                id: Mapped[int] = rf.mapped_column(primary_key=True)
+                name: Mapped[str]
+                kind: Mapped[str]
+
+        class Defaulted(Scratch):
+            __table__ = self.view()
+            id: Mapped[int]
+            name: Mapped[str]
+            kind: Mapped[str] = rf.mapped_column(default="staff")
+
+        assert Defaulted(id=1, name="a").kind == "staff"
+
+    @pytest.mark.parametrize("rename", [("url_slug",), {"name": "url_slug"}], ids=["str", "name"])
+    def test_a_rename_matches_the_column_by_its_sql_name(self, rename):
+        """A table's renamed column keeps its key in a subquery; the rename names it."""
+        Scratch = make_base()
+        pages = sa.Table(
+            "pages",
+            Scratch.metadata,
+            sa.Column("id", sa.Integer, primary_key=True),
+            sa.Column("url_slug", sa.String, key="slug"),
+        )
+        recent = sa.select(pages).subquery("recent")
+        args, kwargs = (rename, {}) if isinstance(rename, tuple) else ((), rename)
+
+        class Recent(Scratch):
+            __table__ = recent
+            id: Mapped[int]
+            path: Mapped[str] = rf.mapped_column(*args, **kwargs)
+
+        assert Recent.path is recent.c.slug
+
+
 class TestMixinsAndOrder:
     def test_mixin_fields_are_inherited_as_real_columns(self):
         Scratch = make_base()
@@ -411,6 +682,21 @@ class TestGuards:
                 __tablename__ = "bad"
                 id: Mapped[int] = rf.mapped_column(primary_key=True)
                 thing: Mapped[int | str]
+
+    def test_a_multi_type_union_with_an_explicit_type_is_declared(self):
+        """A union only fails when rowform has to look its type up, as in SQLAlchemy:
+        one JSON column holding either of two payload shapes is fine."""
+        Scratch = make_base()
+
+        class Event(Scratch):
+            __tablename__ = "event"
+            id: Mapped[int] = rf.mapped_column(primary_key=True)
+            payload: Mapped[dict | list] = rf.mapped_column(sa.JSON())
+            note: Mapped[int | str | None] = rf.mapped_column(sa.String())
+
+        assert isinstance(Event.__table__.c.payload.type, sa.JSON)
+        assert not Event.__table__.c.payload.nullable
+        assert Event.__table__.c.note.nullable
 
     def test_metaclass_conflict_is_real_and_documented(self):
         """Every model carries ModelMeta, so combining with ABC or Protocol

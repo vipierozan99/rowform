@@ -23,24 +23,49 @@ Every concrete model has `__table__`, `__tablename__` and `__column_order__`
 (set it in the class body to pin physical column order). `metadata`, `registry`,
 `type_annotation_map`, `__table__`, `__tablename__` are reserved field names.
 
+Setting `__table__` in the class body instead declares a model over rows something
+else defines: an [`rf.view()`](#rfviewname-metadata-select--schemanone---rfview),
+a subquery or a CTE. No table is built; each field maps to the selectable's column
+keyed by the field name (or, renamed with a leading `mapped_column()` string or
+`name=`, the column of that SQL name), whose type it takes, so annotations such as `Mapped[None]` or `Mapped[Literal["x"]]` are fine.
+Every column must be declared, in any order — `select(Model)` returns all of them —
+and `mapped_column()` may only rename or set `default`/`default_factory`/`init`.
+
 ### `rf.mapped_column(*args, default=..., default_factory=..., init=True, **kwargs) -> Any`
 
 `default`, `default_factory` and `init` configure the dataclass field; everything
-else goes to `sa.Column`. A leading string renames the column; a `TypeEngine`
-positional overrides the annotation's type.
+else goes to `sa.Column`. A leading string (or `name=`) renames the column in SQL;
+its key stays the field name, as in SQLAlchemy, so `Table.c.slug`,
+`insert().values(dataclasses.asdict(instance))` and `Result` keys all use `slug`.
+A `TypeEngine` positional overrides the annotation's type.
+
+Inside the class body the field stands for its column, so `__table_args__` can
+name it, as with the ORM. A literal compared in the body is bound before the
+annotation is resolved, so give that column its type explicitly (the ORM's rule).
 
 ```python
 id: Mapped[int] = rf.mapped_column(primary_key=True)
 slug: Mapped[str] = rf.mapped_column("url_slug", sa.Text(), unique=True)
 org_id: Mapped[int] = rf.mapped_column(sa.ForeignKey("orgs.id"))
+status: Mapped[Status] = rf.mapped_column(sa.Enum(Status))
+deleted_at: Mapped[datetime | None] = rf.mapped_column()
+
+__table_args__ = (
+    sa.UniqueConstraint(slug, org_id),
+    sa.CheckConstraint(sa.or_(status != Status.LIVE, deleted_at.is_(None))),
+    sa.Index("ix_live_slug", slug, unique=True, postgresql_where=deleted_at.is_(None)),
+)
 ```
 
 ### `rf.DEFAULT_TYPE_MAP: dict[type, sa.TypeEngine]`
 
 Used when `Mapped[T]` names no type: `bool`, `int`, `float`, `str`, `bytes`,
 `datetime`, `date`, `time`, `timedelta`, `Decimal`, `UUID`, `dict`/`list` (JSON),
-and any `enum.Enum` subclass. `Mapped[T | None]` makes the column nullable; a
-union of more than one non-`None` type is a `DeclarationError`.
+any `enum.Enum` subclass, and a `Literal` of strings (a non-native `Enum` of its
+values). A base's `type_annotation_map` is consulted first and may map to a type
+class or instance. A `NewType` resolves as itself, then as its root supertype, as
+SQLAlchemy does. `Mapped[T | None]` makes the column nullable; a union of more
+than one non-`None` type needs its column type named, or is a `DeclarationError`.
 
 ### `rf.ModelMeta`
 
@@ -58,7 +83,30 @@ that model's rows — it must expose exactly the model's columns, in order, or
 
 ### `rf.model_for(from_clause) -> type | None`
 
-The model a `Table`, an alias of one, or an `of=` subquery was declared for.
+The model a `Table`, an alias of one, an `of=` subquery, or a `__table__`
+selectable was declared for.
+
+### `rf.view(name, metadata, select, *, schema=None) -> rf.View`
+
+Declares view `name` as `select` on `metadata` and returns it as an `rf.View`, a
+`sa.Table` subclass (SQLAlchemy reflects views as tables too) whose columns are the
+select's, under the same keys. It is kept out of `metadata.tables`, so
+`create_all()` never creates it as a table and Alembic autogenerate neither adds
+nor removes it. `create_all(metadata)` creates the views after the tables, in
+declaration order, skipping any that exist; `drop_all(metadata)` drops them first,
+in reverse, without `CASCADE`. A name is declared once per `MetaData`
+(`DeclarationError`). Being a `Table`, statements over it are cached, and
+`__table__ = rf.view(...)` type-checks as one.
+
+### `rf.views(metadata) -> dict[str, rf.View]`
+
+The views declared on `metadata`, by name, in declaration order.
+
+### `rf.CreateView(view)` / `rf.DropView(view)`
+
+The DDL `create_all`/`drop_all` emit, for a migration:
+`op.execute(rf.CreateView(MyView.__table__))`. The select is rendered with its
+literals inlined; `DROP VIEW IF EXISTS`, no `CASCADE`.
 
 ## `rf.Engine`
 

@@ -11,6 +11,7 @@ import pytest
 import sqlalchemy as sa
 from conftest import Author, Base, Book, Tag, engine_at, sqlite_url
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
+from sqlalchemy.orm import Mapped
 
 import rowform as rf
 
@@ -236,6 +237,19 @@ class TestStatementMatrix:
         rows = await engine.fetch_all(sa.select(active).order_by(active.id))
         assert [a.name for a in rows] == ["ada", "brian", "dan"]
         assert all(isinstance(a, Author) for a in rows)
+
+    async def test_a_model_over_a_selectable_hydrates(self, engine):
+        """Declared in its own order; the rows come back in the selectable's."""
+
+        class AdaBook(Base):
+            __table__ = (
+                sa.select(Book.title, Book.id).where(Book.author_id == 1).subquery("ada_books")
+            )
+            id: Mapped[int]
+            title: Mapped[str]
+
+        rows = await engine.fetch_all(sa.select(AdaBook).order_by(AdaBook.id))
+        assert rows == [AdaBook(id=10, title="structures"), AdaBook(id=11, title="algorithms")]
 
     async def test_a_subquery_joins_back_against_its_table(self, engine):
         newest = rf.alias(
