@@ -117,13 +117,17 @@ class Engine:
         """
         return CoreQuery(statement, self.dialect)
 
-    def _query_for(self, statement: Any) -> tuple[CoreQuery[Any], Any]:
+    def _query_for(self, statement: Any, params: Any = None) -> tuple[CoreQuery[Any], Any]:
         """The compiled query, plus this statement's own literal values.
 
         The structural cache key ignores literals, so the cached compiled object holds
         the *first* statement's; the caller's travel separately as `CacheKey.bindparams`
         (private, like `_generate_cache_key`). `.key` because `CacheKey` is unhashable.
         Bounded LRU so statements built per request do not accumulate forever.
+
+        An INSERT/UPDATE compiles once per set of parameter keys (an executemany's
+        first set), as Core does: a column the parameters leave out then gets its
+        `default=`/`onupdate=`, or the server's, rather than NULL.
         """
         if isinstance(statement, CoreQuery):
             # Another driver's paramstyle would fail as a cryptic driver error.
@@ -135,19 +139,21 @@ class Engine:
                     f"paramstyle. prepare() the statement on this engine."
                 )
             return statement, None
+        column_keys = _column_keys(statement, params)
         cache_key = statement._generate_cache_key()
         if cache_key is None:
             # Uncacheable construct (e.g. `postgresql.insert()`, `inherit_cache=False`):
             # compile fresh; the compiled object then holds this statement's literals.
-            return self.prepare(statement), None
+            return CoreQuery(statement, self.dialect, column_keys), None
         queries = self._queries
-        query = queries.get(cache_key.key)
+        key = cache_key.key if column_keys is None else (cache_key.key, column_keys)
+        query = queries.get(key)
         if query is None:
-            query = queries[cache_key.key] = self.prepare(statement)
+            query = queries[key] = CoreQuery(statement, self.dialect, column_keys)
             if self._cache_size is not None and len(queries) > self._cache_size:
                 queries.popitem(last=False)
         else:
-            queries.move_to_end(cache_key.key)
+            queries.move_to_end(key)
         return query, cache_key.bindparams
 
     @property
@@ -195,7 +201,7 @@ class Engine:
         rollback on release would discard it.
         """
         self._reject_if_in_transaction("fetch_all")
-        query, extracted = self._require_rows(statement)
+        query, extracted = self._require_rows(statement, params)
         rows, hydrate = await self._run(query, params, self._acquire_for(query), extracted)
         return hydrate(rows)
 
@@ -248,7 +254,7 @@ class Engine:
         """
         if chunk < 1:
             raise ConfigurationError(f"chunk must be at least 1, got {chunk}")
-        query, extracted = self._require_rows(statement)
+        query, extracted = self._require_rows(statement, params)
         if acquire is None:
             acquire = self._acquire_for(query, stream=True)
         sql, bound = query.bind(params, extracted)
@@ -305,7 +311,7 @@ class Engine:
         row, narrow the statement with `with_only_columns` instead.
         """
         self._reject_if_in_transaction("fetch_one")
-        query, extracted = self._require_rows(_one_row(statement))
+        query, extracted = self._require_rows(_one_row(statement), params)
         rows, hydrate = await self._run(query, params, self._acquire_for(query), extracted)
         hydrated = hydrate(rows)
         return hydrated[0] if hydrated else None
@@ -324,7 +330,7 @@ class Engine:
 
     async def _execute_scoped(self, statement: Any, parameters: Any, params: dict[str, Any]) -> Any:
         """`execute()` past the in-transaction guard, so `scalar()`/`scalars()` share it."""
-        resolved = self._query_for(statement)
+        resolved = self._query_for(statement, parameters or params)
         many = isinstance(parameters, (list, tuple))
         async with self._scope(commit=many or not resolved[0].is_select) as conn:
             return await conn._execute_any(statement, parameters, params, resolved)
@@ -636,8 +642,8 @@ class Engine:
 
     # --- shared plumbing ----------------------------------------------------
 
-    def _require_rows(self, statement: Any) -> tuple[CoreQuery[Any], Any]:
-        query, extracted = self._query_for(statement)
+    def _require_rows(self, statement: Any, params: Any = None) -> tuple[CoreQuery[Any], Any]:
+        query, extracted = self._query_for(statement, params)
         if not query.returns_rows:
             raise StatementError(
                 "this statement produces no rows; hydrating it would return [] and "
@@ -705,3 +711,15 @@ class Engine:
         """
         if observer is not None:
             observer(sql, perf_counter() - start, rows)
+
+
+def _column_keys(statement: Any, params: Any) -> tuple[str, ...] | None:
+    """The sorted parameter keys an INSERT/UPDATE is compiled for, or None: a
+    SELECT binds by name, so keying its cache on them would only fragment it.
+    """
+    if not params or not (
+        getattr(statement, "is_insert", False) or getattr(statement, "is_update", False)
+    ):
+        return None
+    first = params[0] if isinstance(params, (list, tuple)) else params
+    return tuple(sorted(first))
