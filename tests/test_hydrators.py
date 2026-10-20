@@ -10,6 +10,7 @@ observable there.
 from __future__ import annotations
 
 import datetime as dt
+import decimal
 
 import pytest
 import sqlalchemy as sa
@@ -169,3 +170,44 @@ def test_a_description_of_the_wrong_width_is_refused():
     p = rf.plan(sa.select(Author))
     with pytest.raises(ValueError, match="refusing to hydrate"):
         rf.compile_hydrator(p, SQLITE, [None, None])
+
+
+class TestTypeCodes:
+    """A hydrator is keyed by the DBAPI type codes it was built from: postgres
+    `Numeric` decodes by them, and a migration can change them under a statement.
+    """
+
+    @pytest.fixture
+    def query(self):
+        from sqlalchemy.dialects.postgresql import psycopg
+
+        dialect = psycopg.dialect()
+        return dialect, rf.CoreQuery(sa.select(Wide.amount), dialect)
+
+    def test_new_type_codes_build_a_new_hydrator(self, query):
+        """`numeric(12, 3)` altered to `double precision`: still a `Decimal`, as from a fresh engine."""
+        dialect, query = query
+        numeric = query.hydrator(dialect, [("amount", 1700)], rf.Driver.type_codes)
+        double = query.hydrator(dialect, [("amount", 701)], rf.Driver.type_codes)
+        assert double is not numeric
+        assert double([(1.5,)]) == [decimal.Decimal("1.500")]
+
+    def test_equal_type_codes_keep_the_hydrator(self, query):
+        dialect, query = query
+        first = query.hydrator(dialect, [("amount", 1700)], rf.Driver.type_codes)
+        assert query.hydrator(dialect, [("amount", 1700)], rf.Driver.type_codes) is first
+
+    def test_the_same_description_is_not_read_again(self, query):
+        """asyncpg hands back the description cached with the statement, so the common
+        case costs an identity check rather than a pass over the columns.
+        """
+        dialect, query = query
+        description, reads = [("amount", 1700)], []
+
+        def type_codes(described):
+            reads.append(described)
+            return rf.Driver.type_codes(described)
+
+        first = query.hydrator(dialect, description, type_codes)
+        assert query.hydrator(dialect, description, type_codes) is first
+        assert reads == [description]

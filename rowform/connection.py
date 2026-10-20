@@ -55,6 +55,7 @@ class Connection:
     __slots__ = (
         "_defers_txn",
         "_engine",
+        "_native",
         "_outer",
         "_owns",
         "_token",
@@ -66,7 +67,7 @@ class Connection:
         self,
         engine: Any,
         sa_connection: AsyncConnection,
-        connection: Any,
+        dbapi_connection: Any,
         *,
         owns: bool = True,
     ):
@@ -75,7 +76,9 @@ class Connection:
         #: SQLAlchemy's connection — what owns the transaction.
         self.sa_connection = sa_connection
         #: The driver connection under it — what statements actually run on.
-        self.connection = connection
+        self.connection = dbapi_connection.driver_connection
+        # What the driver's methods take for it (`Driver.native`).
+        self._native = engine.driver.native(dbapi_connection)
         # False when bound to somebody else's connection: rowform neither opens nor ends one.
         self._owns = owns
         self._token: Any = None
@@ -229,9 +232,9 @@ class Connection:
         start = perf_counter() if observer is not None else 0.0
         with engine._around(sql):
             try:
-                report = await engine.driver.execute(self.connection, sql, parameters)
+                report = await engine.driver.execute(self._native, sql, parameters)
             except engine.driver.errors as err:
-                raise engine._wrap(err, sql, parameters)
+                raise engine._wrap(err, self._native, sql, parameters)
         engine._observe(observer, sql, start, None)
         return _result.no_rows(report)
 
@@ -376,9 +379,9 @@ class Connection:
         bound_sets = [bound for _, bound in shaped]
         with engine._around(sql):
             try:
-                report = await engine.driver.execute_many(self.connection, sql, bound_sets)
+                report = await engine.driver.execute_many(self._native, sql, bound_sets)
             except engine.driver.errors as err:
-                raise engine._wrap(err, sql, bound_sets, multi=True)
+                raise engine._wrap(err, self._native, sql, bound_sets, multi=True)
         engine._observe(observer, sql, start, None)
         return report
 
@@ -393,7 +396,7 @@ class Connection:
     ) -> int:
         """Bulk-load through the server's COPY path, on this connection."""
         await self._autobegin()
-        return await self._engine._copy_in(self.connection, table, rows, columns)
+        return await self._engine._copy_in(self._native, table, rows, columns)
 
     def pipeline(self) -> AbstractAsyncContextManager[Any]:
         """psycopg's pipeline mode: statements go out without waiting for each result.
@@ -402,7 +405,7 @@ class Connection:
         than at the statement; it is wrapped like any other, with no `statement` since
         the driver cannot say which one failed. Other drivers raise `UnsupportedError`.
         """
-        return self._wrapped(self._engine.driver.pipeline(self.connection))
+        return self._wrapped(self._engine.driver.pipeline(self._native))
 
     @asynccontextmanager
     async def _wrapped(self, pipeline: Any) -> AsyncIterator[Any]:
@@ -411,7 +414,7 @@ class Connection:
             async with pipeline as entered:
                 yield entered
         except engine.driver.errors as err:
-            raise engine._wrap(err, None, None)
+            raise engine._wrap(err, self._native, None, None)
 
     # --- plumbing ------------------------------------------------------------
 
@@ -422,15 +425,15 @@ class Connection:
         start = perf_counter() if observer is not None else 0.0
         with engine._around(sql):
             try:
-                report = await engine.driver.execute(self.connection, sql, bound)
+                report = await engine.driver.execute(self._native, sql, bound)
             except engine.driver.errors as err:
-                raise engine._wrap(err, sql, bound)
+                raise engine._wrap(err, self._native, sql, bound)
         engine._observe(observer, sql, start, None)
         return report
 
     def _pinned(self) -> AbstractAsyncContextManager[Any]:
         """Stands in for the engine's pool checkout, handing back this scope's connection."""
-        return _Held(self.connection)
+        return _Held(self._native)
 
     def __repr__(self) -> str:
         state = "bound" if not self._owns else "open"

@@ -27,7 +27,9 @@ class CoreQuery(Generic[R]):
     """One statement, compiled for one dialect."""
 
     __slots__ = (
+        "_codes",
         "_compiled",
+        "_described",
         "_expanding",
         "_hydrate",
         "_keys",
@@ -71,6 +73,8 @@ class CoreQuery(Generic[R]):
         self._prefetch = _prefetch_defaults(compiled)
         self._plan: Plan | None = plan(statement) if _returns_rows(statement) else None
         self._hydrate: Any = None
+        self._codes: Any = None
+        self._described: Any = None
         self._metadata: Any = None
         #: A SELECT, as opposed to a write with RETURNING; decides commit and streaming.
         self.is_select: bool = bool(getattr(statement, "is_select", False))
@@ -145,17 +149,24 @@ class CoreQuery(Generic[R]):
             for key, value in values.items()
         }
 
-    def hydrator(self, dialect: Any, description: Any) -> Any:
-        """The generated `rows -> list` function, built on first use and cached: the
-        result processors need the DBAPI type codes the driver reports.
+    def hydrator(self, dialect: Any, description: Any, type_codes: Any) -> Any:
+        """The generated `rows -> list` function for rows `description` describes.
+
+        The result processors depend on the DBAPI type codes, so it is built from them
+        and built again when the driver reports others: a migration changed a column's
+        type under the statement. `type_codes` is the driver's (`Driver.type_codes`).
+        The same description as last time is not compared again; asyncpg hands back
+        the one cached with the prepared statement.
         """
-        hydrate = self._hydrate
-        if hydrate is None:
+        if description is self._described:
+            return self._hydrate
+        codes = type_codes(description)
+        if codes != self._codes:
             assert self._plan is not None
-            hydrate = self._hydrate = compile_hydrator(
-                self._plan, dialect, [column[1] for column in description]
-            )
-        return hydrate
+            self._hydrate = compile_hydrator(self._plan, dialect, codes)
+            self._codes = codes
+        self._described = description
+        return self._hydrate
 
     def __repr__(self) -> str:
         return f"<CoreQuery {self.sql!r} {self._plan!r}>"

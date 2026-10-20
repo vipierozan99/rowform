@@ -208,15 +208,28 @@ async def outcome(run) -> Any:
         return failure(err)
 
 
+async def drop_schema(admin: Any) -> None:
+    async with admin.begin() as conn:
+        await conn.exec_driver_sql("DROP VIEW IF EXISTS m_items_v")
+        await conn.exec_driver_sql("DROP TABLE IF EXISTS m_items")
+        if admin.dialect.name == "postgresql":
+            await conn.exec_driver_sql("DROP TYPE IF EXISTS m_kind")
+            await conn.exec_driver_sql("DROP TYPE IF EXISTS m_kind_new")
+
+
+async def clean_up(url: str) -> None:
+    """After each test: other modules compare the database's tables with theirs."""
+    admin = create_async_engine(url)
+    try:
+        await drop_schema(admin)
+    finally:
+        await admin.dispose()
+
+
 async def build_schema(url: str, shape: str) -> None:
     admin = create_async_engine(url)
     try:
-        async with admin.begin() as conn:
-            await conn.exec_driver_sql("DROP VIEW IF EXISTS m_items_v")
-            await conn.exec_driver_sql("DROP TABLE IF EXISTS m_items")
-            if admin.dialect.name == "postgresql":
-                await conn.exec_driver_sql("DROP TYPE IF EXISTS m_kind")
-                await conn.exec_driver_sql("DROP TYPE IF EXISTS m_kind_new")
+        await drop_schema(admin)
         await rf.Engine(admin).create_all(MigrationBase.metadata)
         async with admin.begin() as conn:
             await conn.execute(sa.insert(_items), ROWS)
@@ -300,6 +313,7 @@ async def test_old_code_after_a_migration(target, shape, context):
     finally:
         for engine in engines:
             await engine.dispose()
+        await clean_up(migration_url)
 
     for attempt, (theirs, mine) in enumerate(zip(cores, rowforms, strict=True), 1):
         assert mine == truth or (mine == theirs and isinstance(mine, tuple)) or (
@@ -368,3 +382,4 @@ class TestAPoolerThatSharesStatements:
         finally:
             for engine in engines:
                 await engine.dispose()
+            await clean_up(direct)

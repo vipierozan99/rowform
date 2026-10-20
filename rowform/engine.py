@@ -276,9 +276,7 @@ class Engine:
                 self._stream(conn, sql, bound, chunk, query)
             ) as chunks:
                 async for rows, description in chunks:
-                    hydrate = query._hydrate
-                    if hydrate is None:
-                        hydrate = query.hydrator(self.dialect, description)
+                    hydrate = query.hydrator(self.dialect, description, self.driver.type_codes)
                     total += len(rows)
                     for row in hydrate(rows):
                         yield row
@@ -375,8 +373,8 @@ class Engine:
         run. Refused inside a scope, as the one-shot reads are.
         """
         self._reject_if_in_transaction("copy_in")
-        async with self._checkout(commit=True) as (_, conn):
-            return await self._copy_in(conn, table, rows, columns)
+        async with self._checkout(commit=True) as (_, dbapi_conn):
+            return await self._copy_in(self.driver.native(dbapi_conn), table, rows, columns)
 
     async def _copy_in(
         self,
@@ -408,7 +406,7 @@ class Engine:
                     conn, table, [c.name for c in selected], records
                 )
             except self.driver.errors as err:
-                raise self._wrap(err, label, None)
+                raise self._wrap(err, conn, label, None)
         self._observe(observer, label, start, copied)
         return copied
 
@@ -430,7 +428,9 @@ class Engine:
 
     @asynccontextmanager
     async def _checkout(self, *, commit: bool = False) -> AsyncIterator[tuple[Any, Any]]:
-        """One pooled checkout, as `(sqlalchemy_connection, driver_connection)`.
+        """One pooled checkout, as `(sqlalchemy_connection, dbapi_connection)`: the
+        second is SQLAlchemy's adapter, which `driver.native()` turns into what the
+        driver runs on.
 
         `commit=True` is load-bearing: a one-shot write run on the driver connection
         sits in the driver's own implicit transaction (pysqlite, psycopg) and the pool's
@@ -440,13 +440,13 @@ class Engine:
         cm = self.sa_engine.begin() if commit else self.sa_engine.connect()
         async with cm as conn:
             fairy = await conn.get_raw_connection()
-            driver_conn = fairy.driver_connection
+            dbapi_conn = fairy.dbapi_connection
             try:
-                yield conn, driver_conn
+                yield conn, dbapi_conn
             except asyncio.CancelledError:
                 # The statement may still be running (aiosqlite's worker thread) and
                 # the pool will hand this connection to the next borrower regardless.
-                await self.driver.on_cancelled(driver_conn)
+                await self.driver.on_cancelled(self.driver.native(dbapi_conn))
                 raise
             except Exception as err:
                 if self._is_disconnect(err, fairy.dbapi_connection):
@@ -468,12 +468,17 @@ class Engine:
         return dead
 
     def _wrap(
-        self, err: Exception, sql: str | None, params: Any, *, multi: bool = False
+        self, err: Exception, conn: Any, sql: str | None, params: Any, *, multi: bool = False
     ) -> Exception:
         """`err`, a driver error, as the `sa.exc.DBAPIError` subclass SQLAlchemy's
         `Connection` would have raised, so `except sa.exc.IntegrityError` keeps working.
         Its `orig` is the DBAPI exception and its cause the same, as in SQLAlchemy.
+
+        A statement the schema changed under also invalidates what was prepared
+        before (`Driver.invalidate`), as Core's execution context does for its own.
         """
+        if self.driver.is_stale(err):
+            self.driver.invalidate(conn)
         dbapi = self.dialect.loaded_dbapi
         translated = self.driver.translate(err)
         wrapped = DBAPIError.instance(
@@ -503,7 +508,7 @@ class Engine:
         fairy = await greenlet_spawn(pool.connect)
         dbapi_conn = fairy.dbapi_connection
         assert dbapi_conn is not None  # a fresh checkout is never invalidated
-        driver_conn = dbapi_conn.driver_connection
+        driver_conn = self.driver.native(dbapi_conn)
         try:
             async with self.driver.autocommit(driver_conn):
                 yield driver_conn
@@ -520,17 +525,17 @@ class Engine:
 
     @asynccontextmanager
     async def _connection(self) -> AsyncIterator[Any]:
-        """The read seam: a checked-out driver connection, nothing committed. A mock
-        engine overrides this and `_direct_connection`.
+        """The read seam: a checked-out connection as the driver runs on it, nothing
+        committed. A mock engine overrides this and `_direct_connection`.
         """
-        async with self._checkout() as (_, driver_conn):
-            yield driver_conn
+        async with self._checkout() as (_, dbapi_conn):
+            yield self.driver.native(dbapi_conn)
 
     @asynccontextmanager
     async def _write_connection(self) -> AsyncIterator[Any]:
         """`_connection()`, committed on the way out."""
-        async with self._checkout(commit=True) as (_, driver_conn):
-            yield driver_conn
+        async with self._checkout(commit=True) as (_, dbapi_conn):
+            yield self.driver.native(dbapi_conn)
 
     def _acquire_for(self, query: CoreQuery[Any], *, stream: bool = False) -> Any:
         """Which checkout a one-shot takes: committing for a write, direct for a SELECT
@@ -546,16 +551,16 @@ class Engine:
     @asynccontextmanager
     async def acquire(self) -> AsyncIterator[Any]:
         """Raw driver connection, for anything this engine does not model."""
-        async with self._connection() as conn:
-            yield conn
+        async with self._checkout() as (_, dbapi_conn):
+            yield dbapi_conn.driver_connection
 
     @asynccontextmanager
     async def _scope(self, *, commit: bool) -> AsyncIterator[Connection]:
         """One checkout as a `Connection` that does not autobegin, for the engine's own
         `execute`-track one-shots.
         """
-        async with self._checkout(commit=commit) as (sa_conn, driver_conn):
-            yield Connection(self, sa_conn, driver_conn, owns=False)
+        async with self._checkout(commit=commit) as (sa_conn, dbapi_conn):
+            yield Connection(self, sa_conn, dbapi_conn, owns=False)
 
     @asynccontextmanager
     async def connect(self, bind: Any = None, **execution_options: Any) -> AsyncIterator[Connection]:
@@ -576,7 +581,7 @@ class Engine:
                     "open; configure them where the connection was opened"
                 )
             sa_conn = await self._resolve(bind)
-            conn = Connection(self, sa_conn, await self._driver_connection(sa_conn), owns=False)
+            conn = Connection(self, sa_conn, await self._dbapi_connection(sa_conn), owns=False)
             # Registered even though bound, so `engine.fetch_*` inside is refused.
             conn._enter()
             try:
@@ -584,10 +589,10 @@ class Engine:
             finally:
                 conn._exit()
             return
-        async with self._checkout() as (sa_conn, driver_conn):
+        async with self._checkout() as (sa_conn, dbapi_conn):
             if execution_options:
                 await sa_conn.execution_options(**execution_options)
-            conn = Connection(self, sa_conn, driver_conn)
+            conn = Connection(self, sa_conn, dbapi_conn)
             conn._enter()
             try:
                 yield conn
@@ -599,11 +604,11 @@ class Engine:
         """A connection scope with a transaction open — `AsyncEngine.begin()`: commits on
         clean exit, rolls back on exception, `conn.begin_nested()` for savepoints.
         """
-        async with self._checkout() as (sa_conn, driver_conn):
+        async with self._checkout() as (sa_conn, dbapi_conn):
             if execution_options:
                 await sa_conn.execution_options(**execution_options)
             async with sa_conn.begin():
-                conn = Connection(self, sa_conn, driver_conn)
+                conn = Connection(self, sa_conn, dbapi_conn)
                 conn._enter()
                 try:
                     yield conn
@@ -656,8 +661,8 @@ class Engine:
         )
 
     @staticmethod
-    async def _driver_connection(conn: AsyncConnection) -> Any:
-        return (await conn.get_raw_connection()).driver_connection
+    async def _dbapi_connection(conn: AsyncConnection) -> Any:
+        return (await conn.get_raw_connection()).dbapi_connection
 
     def _reject_if_in_transaction(self, method: str) -> None:
         """Inside `connect()`/`begin()` a one-shot would take a *different* pooled
@@ -689,26 +694,43 @@ class Engine:
     async def _run(
         self, query: CoreQuery[Any], params: dict[str, Any], acquire: Any, extracted: Any = None
     ) -> Any:
-        """Execute and return `(rows, hydrator)`. The driver describes its result only
-        while the hydrator is unbuilt: postgres `Numeric` needs the DBAPI type codes.
+        """Execute and return `(rows, hydrator)`. The hydrator is checked against the
+        driver's description whenever there is one: postgres `Numeric` needs the DBAPI
+        type codes, and a migration can change them.
         """
         sql, bound = query.bind(params, extracted)
-        hydrate = query._hydrate
         observer = self.observer
         async with acquire() as conn:
             # Timed from here: the observer's contract is the driver round trip.
             start = perf_counter() if observer is not None else 0.0
-            with self._around(sql):
-                try:
-                    rows, description = await self.driver.fetch(
-                        conn, sql, bound, hydrate is None
-                    )
-                except self.driver.errors as err:
-                    raise self._wrap(err, sql, bound)
-        if hydrate is None:
-            hydrate = query.hydrator(self.dialect, description)
+            rows, description = await self._fetch(conn, sql, bound, query._hydrate is None)
+        hydrate = (
+            query._hydrate
+            if description is None
+            else query.hydrator(self.dialect, description, self.driver.type_codes)
+        )
         self._observe(observer, sql, start, len(rows))
         return rows, hydrate
+
+    async def _fetch(self, conn: Any, sql: str, bound: Any, describe: bool) -> Any:
+        """`driver.fetch`, inside `around`. A statement the schema changed under, with
+        no transaction open, is prepared again and run once more, as asyncpg does for
+        its own cache: nothing was done, so nothing is lost. `around` sees both round
+        trips. Inside a transaction it raises, which aborted it, as Core does.
+        """
+        driver = self.driver
+        with self._around(sql):
+            try:
+                return await driver.fetch(conn, sql, bound, describe)
+            except driver.errors as err:
+                wrapped = self._wrap(err, conn, sql, bound)
+                if not driver.is_stale(err) or driver.in_transaction(conn):
+                    raise wrapped
+        with self._around(sql):
+            try:
+                return await driver.fetch(conn, sql, bound, True)
+            except driver.errors as err:
+                raise self._wrap(err, conn, sql, bound)
 
     def _chunks(self, query: CoreQuery[Any], params: dict[str, Any], extracted: Any,
                 default_chunk: int, acquire: Any) -> Any:
@@ -729,9 +751,7 @@ class Engine:
                 self._stream(conn, sql, bound, wanted, query)
             ) as batches:
                 async for rows, description in batches:
-                    hydrate = query._hydrate
-                    if hydrate is None:
-                        hydrate = query.hydrator(self.dialect, description)
+                    hydrate = query.hydrator(self.dialect, description, self.driver.type_codes)
                     total += len(rows)
                     yield hydrate(rows)
             self._observe(observer, sql, start, total)
@@ -758,7 +778,7 @@ class Engine:
                     except StopAsyncIteration:
                         return
                     except self.driver.errors as err:
-                        raise self._wrap(err, sql, bound)
+                        raise self._wrap(err, conn, sql, bound)
                 yield batch
 
     def _observe(self, observer: Observer | None, sql: str, start: float, rows: int | None) -> None:
