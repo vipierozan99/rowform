@@ -18,3 +18,8 @@ cov *args='':
 # Unified benchmark CLI. `just bench --help` lists every subcommand.
 bench *args='':
     uv run --all-groups python -m benchmarks {{ args }}
+
+# The pgbouncers tests/test_pgbouncer.py and test_migrations.py run through
+# (`up` or `down`); see scripts/pgbouncer.sh.
+pgbouncer action:
+    scripts/pgbouncer.sh {{ action }}

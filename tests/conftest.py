@@ -39,6 +39,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.orm import Mapped
+from sqlalchemy.pool import NullPool
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -306,3 +307,94 @@ async def pg_engine(pg_dsn):
     cursors, pipelining. Skips with the rest when no server is reachable."""
     async with seeded(pg_url(pg_dsn)) as db:
         yield db
+
+
+# --------------------------------------------------------------------------
+# pgbouncer, in front of the same server (scripts/pgbouncer.sh, CI services)
+# --------------------------------------------------------------------------
+
+#: Port of each pooler; 1.21 is the first pgbouncer with `max_prepared_statements`.
+PGBOUNCERS = {
+    "1.20-transaction": 6431,
+    "1.22-transaction": 6432,
+    "1.22-session": 6433,
+}
+
+
+def pgbouncer_dsn(dsn: str, pooler: str) -> str:
+    return re.sub(r":\d+/", f":{PGBOUNCERS[pooler]}/", dsn, count=1)
+
+
+def pgbouncer_config(driver: str, pooler: str) -> dict:
+    """The engine configuration SQLAlchemy and the driver document for `pooler`, and
+    nothing rowform-specific: the suite holds rowform to the configuration Core needs.
+
+    Before 1.21 transaction pooling cannot carry a prepared statement from one
+    transaction to the next. asyncpg: SQLAlchemy's recipe (`NullPool`, unique
+    `prepared_statement_name_func`) plus asyncpg's own `statement_cache_size=0`,
+    without which Core's `executemany` and codec setup still use cached named
+    statements. psycopg: `prepare_threshold=None`, also wanted on 1.22 unless libpq
+    is 17+, which psycopg needs to close statements in a way pgbouncer tracks.
+    """
+    if pooler == "1.20-transaction":
+        if driver == "asyncpg":
+            return {
+                "poolclass": NullPool,
+                "connect_args": {
+                    "prepared_statement_name_func": lambda: f"__asyncpg_{uuid.uuid4()}__",
+                    "statement_cache_size": 0,
+                },
+            }
+        return {"poolclass": NullPool, "connect_args": {"prepare_threshold": None}}
+    if pooler == "1.22-transaction" and driver == "psycopg":
+        import psycopg
+
+        if psycopg.pq.version() < 170000:
+            return {"connect_args": {"prepare_threshold": None}}
+    return {}
+
+
+async def reset_pgbouncer(dsn: str, servers: int = 3) -> None:
+    """Drop every server connection (and the prepared statements on it), then open
+    `servers` at once so the pool has that many: with `server_round_robin` each
+    transaction after this lands on a different server than the one before.
+    """
+    import asyncpg
+
+    plain = dsn.split("?")[0]
+    admin = await asyncpg.connect(re.sub(r"/[^/]*$", "/pgbouncer", plain), statement_cache_size=0)
+    try:
+        await admin.execute("KILL rowform_bench")
+        await admin.execute("RESUME rowform_bench")
+    finally:
+        await admin.close()
+    clients = [await asyncpg.connect(plain, statement_cache_size=0) for _ in range(servers)]
+    try:
+        for client in clients:
+            await client.execute("BEGIN; SELECT 1")
+        for client in clients:
+            await client.execute("ROLLBACK")
+    finally:
+        for client in clients:
+            await client.close()
+
+
+async def require_pgbouncer(request, pg_dsn: str, pooler: str) -> str:
+    """`pooler`'s DSN, reset and spread; skips like `pg_dsn` when it is not running."""
+    try:
+        with socket.create_connection(("127.0.0.1", PGBOUNCERS[pooler]), timeout=1):
+            pass
+    except OSError:
+        message = f"pgbouncer {pooler} not reachable; scripts/pgbouncer.sh up"
+        if request.config.getoption("--pg-required"):
+            pytest.fail(message)
+        pytest.skip(message)
+    dsn = pgbouncer_dsn(pg_dsn, pooler)
+    await reset_pgbouncer(dsn)
+    return dsn
+
+
+@pytest.fixture(params=list(PGBOUNCERS))
+async def pgbouncer(request, pg_dsn):
+    """`(pooler, dsn)` for each pgbouncer, reset and spread."""
+    return request.param, await require_pgbouncer(request, pg_dsn, request.param)
