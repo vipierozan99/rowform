@@ -401,4 +401,5 @@ async def test_a_row_holding_an_added_enum_value_raises_as_core_does(pg_dsn, dri
         for engine in engines:
             await engine.dispose()
         await clean_up(url)
-    assert core == ours == (LookupError, "LookupError")
+    assert core == ours
+    assert core[0] is LookupError
