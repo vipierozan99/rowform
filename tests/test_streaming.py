@@ -13,6 +13,8 @@ row for row and type for type, is broken however elegantly it chunks.
 
 from __future__ import annotations
 
+from contextlib import aclosing
+
 import pytest
 import sqlalchemy as sa
 from conftest import Author, Book, Wide, engine_at, pg_url, seed, sqlite_db
@@ -168,8 +170,9 @@ class TestConnectionHandling:
 
         async def spy(*args):
             try:
-                async for batch in driver_stream(*args):
-                    yield batch
+                async with aclosing(driver_stream(*args)) as inner:
+                    async for batch in inner:
+                        yield batch
             finally:
                 closed.append(True)
 
