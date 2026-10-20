@@ -345,7 +345,7 @@ def pgbouncer_config(driver: str, pooler: str) -> dict:
                     "statement_cache_size": 0,
                 },
             }
-        return {"poolclass": NullPool, "connect_args": {"prepare_threshold": None}}
+        return {"connect_args": {"prepare_threshold": None}}
     if pooler == "1.22-transaction" and driver == "psycopg":
         import psycopg
 

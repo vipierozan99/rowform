@@ -39,9 +39,11 @@ serializes about 2x slower — leave `slots` off for JSON endpoints.
 
 ## One-shot or scope
 
-A one-shot runs one statement on a pooled connection with **no transaction**;
-a scope holds one connection, and `begin()` wraps it in a transaction. One-shot
-when one statement is the whole job; scope when two statements must agree.
+A one-shot runs one statement on a pooled connection with **no transaction**
+(on asyncpg, the first run of a statement on a connection prepares it inside a
+`BEGIN`/`COMMIT`); a scope holds one connection, and `begin()` wraps it in a
+transaction. One-shot when one statement is the whole job; scope when two
+statements must agree.
 
 ```python
 users = await db.fetch_all(sa.select(User).limit(100))      # one-shot, no BEGIN
@@ -269,6 +271,82 @@ class User(Timestamped):
     __column_order__ = ("id", "name", "created")
     ...
 ```
+
+### Migrating under live traffic
+
+In a rolling deploy the old code keeps serving while the migration runs, with
+statements it prepared and hydrators it built against the old schema. A model
+selects each of its columns by name, so what matters is what happens to those:
+
+| migration | old code, connected directly | old code behind pgbouncer 1.21+ with prepared statements |
+|---|---|---|
+| add a nullable column | safe | safe |
+| add a column with a server default | safe | safe |
+| add an enum value | safe until it reads a row holding the new value, then `LookupError`, as Core | same |
+| rename a column it selects | every read raises `UndefinedColumn` | same |
+| drop a column it selects | every read raises `UndefinedColumn` | same |
+| change a column's type | a statement prepared before, in a scope or a session, can raise once per connection, then reads the new type; a one-shot read runs again and does not raise | fails until the pooler drops its servers; see below |
+| drop and recreate an enum | as a type change | as a type change |
+| drop and recreate a view, in one transaction | reads the new view; as a type change if a column's type changed | same |
+
+All of this is Core's behaviour too, with one difference: after `numeric` becomes
+`double precision` (or back) a warm Core engine keeps decoding with the old type's
+processor, while rowform rebuilds its hydrator from the type codes the server
+now reports and returns what a fresh engine would.
+
+So a rename or a drop is expand/contract: add the new column and write both, deploy
+code that reads the new one, then drop the old in a later migration. Remove a field
+from the model and deploy before dropping its column. A view's columns cannot change
+type under it and `rf.DropView` has no `CASCADE`, so drop dependent views first,
+alter, and recreate them in the same migration (Alembic's transaction on postgres).
+
+Behind pgbouncer 1.21+ with `max_prepared_statements`, the pooler keeps one
+server-side statement per query text and hands it to every client, so after a type
+change the stale one keeps failing, for Core as for rowform, until its server
+connection closes. `RECONNECT <db>` on pgbouncer's admin console clears it, but a
+client that did not meet the error before then is handed a fresh statement under
+its old row description, and asyncpg decodes the new type's bytes with the old
+codec. Do not change a column's type in place behind such a pooler: add a column of
+the new type and switch to it, as for a rename.
+
+## Behind pgbouncer
+
+rowform prepares statements where Core does (asyncpg: SQLAlchemy's adapter cache;
+psycopg: psycopg's own), so it needs exactly the configuration Core needs, and no
+setting of its own:
+
+| pooling | asyncpg | psycopg |
+|---|---|---|
+| session | defaults | defaults |
+| transaction, pgbouncer 1.21+ with `max_prepared_statements > 0` | defaults | defaults with libpq 17+; else `prepare_threshold=None` |
+| transaction, older pgbouncer or `max_prepared_statements = 0` | `poolclass=NullPool` (or `prepared_statement_cache_size=0`), `prepared_statement_name_func`, `statement_cache_size=0` | `prepare_threshold=None` |
+
+```python
+# transaction pooling, pgbouncer before 1.21
+engine = create_async_engine(
+    "postgresql+asyncpg://app@pgbouncer/app",
+    poolclass=NullPool,
+    connect_args={
+        "prepared_statement_name_func": lambda: f"__asyncpg_{uuid4()}__",
+        "statement_cache_size": 0,
+    },
+)
+db = rf.Engine(engine)
+```
+
+`prepared_statement_name_func` is SQLAlchemy's recipe; `statement_cache_size=0` is
+asyncpg's, and Core needs it too: its `executemany` and the dialect's codec setup go
+through asyncpg's own cache, whose names collide between worker processes on a
+shared server. Prepared statements under unique names are never deallocated in
+transaction pooling, as SQLAlchemy warns; let pgbouncer's `server_lifetime` retire
+them. The libpq 17 requirement is psycopg's own, documented for prepared statements
+through pgbouncer. Tested on pgbouncer 1.20 and 1.22.
+
+On asyncpg a one-shot read that has to prepare its statement does so inside a
+`BEGIN`/`COMMIT`, as Core always does; one whose statement is already prepared on
+its connection runs without. With no cache (`NullPool`, or a cache size of 0) every
+read prepares, and costs what Core's does. See also
+[Migrating under live traffic](#migrating-under-live-traffic).
 
 ## Testing with sqlite
 

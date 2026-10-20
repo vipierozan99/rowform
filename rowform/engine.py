@@ -207,8 +207,11 @@ class Engine:
 
         A one-shot: a SELECT runs outside any transaction, straight from the pool
         (`_direct_connection`), so no isolation level applies to it — a read that
-        needs one belongs in `begin()`. A write with RETURNING commits, or the pool's
-        rollback on release would discard it.
+        needs one belongs in `begin()`. On asyncpg the run that first prepares the
+        statement on a connection is inside one (`AsyncpgDriver.fetch`). A read
+        refused because the schema changed under its statement runs once more
+        (`_fetch`). A write with RETURNING commits, or the pool's rollback on release
+        would discard it.
         """
         self._reject_if_in_transaction("fetch_all")
         query, extracted = self._require_rows(statement, params)

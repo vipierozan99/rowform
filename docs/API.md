@@ -144,7 +144,10 @@ through Core, once per compiled shape.
 
 A one-shot `SELECT` **checks out from the pool directly and runs outside any
 transaction**: no `Connection`/`AsyncConnection` is built, no `BEGIN` is sent,
-and on psycopg the driver's `autocommit` is flipped on for the statement. No
+and on psycopg the driver's `autocommit` is flipped on for the statement. On
+asyncpg a statement not yet prepared on that connection is prepared and run inside
+a `BEGIN`/`COMMIT`, as Core runs every statement: behind a transaction pooler the
+two would otherwise reach different servers ([pgbouncer](GUIDE.md#behind-pgbouncer)). No
 isolation level applies to such a read — a lone statement is one snapshot — so a
 read that needs one belongs in a [scope](#scopes). The direct checkout is skipped,
 per call and silently, whenever anything listens on the engine's `engine_connect`
@@ -252,6 +255,26 @@ connection, on both the direct and the ordinary checkout, so the next borrower
 gets a fresh one. Bound scopes (`bind=`) are never invalidated by rowform — the
 connection is the caller's.
 
+### After a migration
+
+Statements are prepared where Core prepares them: on asyncpg in SQLAlchemy's
+per-connection adapter cache, so `prepared_statement_cache_size` and
+`prepared_statement_name_func` apply; on psycopg by psycopg, after
+`prepare_threshold` runs. When postgres refuses one prepared before the schema
+changed (`cached plan must not change result type`; `cache lookup failed for type`
+after an enum is recreated), rowform invalidates as Core does: on asyncpg the
+dialect-wide flag Core sets, so Core's statements and rowform's are prepared again;
+on psycopg the connection's prepared statements, as the `ROLLBACK` ending a Core
+transaction would. A read with no transaction open then runs once more — `around`
+sees both round trips, the observer one statement. Inside a transaction the error
+is raised (`sa.exc.NotSupportedError`, `sa.exc.InternalError`), as Core raises it.
+
+The generated hydrator is keyed by the DBAPI type codes it was built from and is
+rebuilt when the driver reports others, so a column whose type changed decodes as a
+fresh engine would; per statement this is an identity check on asyncpg and a
+comparison of the type codes on psycopg, never anything per row. Which migrations
+are safe for code still running: [GUIDE](GUIDE.md#migrating-under-live-traffic).
+
 ### Errors
 
 A driver error is raised as SQLAlchemy raises it: the matching `sa.exc.DBAPIError`
@@ -329,7 +352,7 @@ Around = Callable[[str], AbstractContextManager[Any]]
 ```
 
 Called with the SQL (for `copy_in`, `COPY table (columns)`) before every driver
-round trip. The context manager is entered as the statement goes out and exited
+round trip, including a read run again after a migration. The context manager is entered as the statement goes out and exited
 when the driver answers or raises, seeing the exception. A stream enters it once per chunk fetched, never across a
 `yield`, so a contextvar-based span (OpenTelemetry) is not left current while
 the consumer's code runs. Rows are hydrated outside it.
@@ -354,9 +377,9 @@ SQLAlchemy (see [Disconnects](#disconnects) and the Errors note below it).
 
 | | |
 |---|---|
-| `rf.CoreQuery` | one statement compiled for one dialect: `.sql`, `.returns_rows`, `.is_select`, `.entities`, `.bind(params, extracted)`, `.hydrator(dialect, description)` |
+| `rf.CoreQuery` | one statement compiled for one dialect: `.sql`, `.returns_rows`, `.is_select`, `.entities`, `.bind(params, extracted)`, `.hydrator(dialect, description, type_codes)` |
 | `rf.plan(statement) -> Plan` | what the rows mean: a from clause selected whole is a model, anything else a scalar (a bare `text()` included); a hand-listed full column list stays scalars. `Plan.wrap` is true at two or more entities |
 | `rf.compile_hydrator(plan, dialect, coltypes)` | the generated `rows -> list` function; source on `__source__`; `PlanError` if the column counts disagree |
 | `rf.result_processor(column, dialect, coltype)` | the dialect-adapted type's decoder, or `None` for a bare store |
-| `rf.Driver` / `rf.driver_for(dialect)` | per-driver `fetch`/`stream`/`execute`/`execute_many`/`copy_in`/`pipeline`/`autocommit`, plus `errors`/`translate` for SQLAlchemy-compatible driver errors; the seam a mock replaces |
+| `rf.Driver` / `rf.driver_for(dialect)` | per-driver `fetch`/`stream`/`execute`/`execute_many`/`copy_in`/`pipeline`/`autocommit`, plus `errors`/`translate` for SQLAlchemy-compatible driver errors and `is_stale`/`invalidate`/`in_transaction`/`type_codes` for a schema that changed; each takes `native(dbapi_connection)`, the driver connection (on asyncpg, SQLAlchemy's adapter around it); the seam a mock replaces |
 | `rf.__version__` | single-sourced into the package metadata |

@@ -18,6 +18,10 @@ not — so a behaviour asserted on one backend has not been tested. PostgreSQL
 tests skip when no server is reachable; run `just test . --pg-required` before
 opening a PR, as CI does. `ROWFORM_TEST_DSN` overrides the default DSN.
 
+`tests/test_pgbouncer.py` and `tests/test_migrations.py` also run through three
+pgbouncers in front of that server (1.20 and 1.22 in transaction pooling, 1.22 in
+session pooling); `just pgbouncer up` starts them with Docker, as CI runs them.
+
 Types are tested, not declared: `tests/typing/positive.py` uses `assert_type`,
 `tests/typing/negative.py` carries a `# pyright: ignore` on every line that must
 fail. Change both when you change a signature.

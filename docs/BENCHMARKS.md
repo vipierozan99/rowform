@@ -67,10 +67,13 @@ so they are quoted from the sweep that reproduces and flagged here.
 ### Provenance and what is stale
 
 Rows were recorded under their previous names (`SQLAlchemy Core (positional)`,
-`rowform (no transaction)`); the contenders are the same code. Two things have
+`rowform (no transaction)`); the contenders are the same code. Three things have
 changed since: the one-shot read now takes a direct pool checkout (`ce8ac4f`), which
-neither table's `one-shot` row has been re-recorded for, and the contender set was
-cut from 66 to the rows above. A fresh sweep supersedes this section when it lands; until then these
+neither table's `one-shot` row has been re-recorded for; the contender set was
+cut from 66 to the rows above; and asyncpg statements are prepared through
+SQLAlchemy's adapter cache, with each hydrator checked against the result's type
+codes, which a postgres row has not been re-recorded for either (an interleaved
+before/after run on an unpinned box is in the pull request that made the change). A fresh sweep supersedes this section when it lands; until then these
 are the numbers.
 
 Raw `run.json` artifacts live on the `bench/<date>-<topic>` branches named above.
