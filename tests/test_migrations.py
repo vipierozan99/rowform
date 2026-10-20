@@ -383,3 +383,22 @@ class TestAPoolerThatSharesStatements:
             for engine in engines:
                 await engine.dispose()
             await clean_up(direct)
+
+
+@pytest.mark.parametrize("driver", ["asyncpg", "psycopg"])
+async def test_a_row_holding_an_added_enum_value_raises_as_core_does(pg_dsn, driver):
+    """`ADD VALUE` is safe for old code until it reads a row holding the new value."""
+    url = pg_url(pg_dsn, driver)
+    await build_schema(url, "enum_add_value")
+    await migrate(url, ["ALTER TYPE m_kind ADD VALUE 'c'"])
+    await migrate(url, ["UPDATE m_items SET kind = 'c' WHERE id = 2"])
+    model, statement, params = STATEMENTS["items"]
+    engines = [create_async_engine(url) for _ in range(2)]
+    try:
+        core = await outcome(runner("outside", engines[0], statement, params, model))
+        ours = await outcome(runner("outside", rf.Engine(engines[1]), statement, params, model))
+    finally:
+        for engine in engines:
+            await engine.dispose()
+        await clean_up(url)
+    assert core == ours == (LookupError, "LookupError")
