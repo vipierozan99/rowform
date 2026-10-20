@@ -11,8 +11,8 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Callable, Sequence
-from contextlib import AbstractContextManager, asynccontextmanager, nullcontext
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
+from contextlib import AbstractContextManager, aclosing, asynccontextmanager, nullcontext
 from time import perf_counter
 from typing import Any, TypeVar, overload
 
@@ -257,7 +257,7 @@ class Engine:
 
     async def _iterate(
         self, statement: Any, chunk: int, params: dict[str, Any], acquire: Any
-    ) -> AsyncIterator[Any]:
+    ) -> AsyncGenerator[Any, None]:
         """Shared by `Engine.fetch_iter` and `Connection.fetch_iter`; `acquire=None`
         means take a pooled connection, resolved after compiling (a RETURNING write
         needs the committing checkout).
@@ -272,8 +272,10 @@ class Engine:
         start = perf_counter() if observer is not None else 0.0
         total = 0
         try:
-            async with acquire() as conn:
-                async for rows, description in self._stream(conn, sql, bound, chunk, query):
+            async with acquire() as conn, aclosing(
+                self._stream(conn, sql, bound, chunk, query)
+            ) as chunks:
+                async for rows, description in chunks:
                     hydrate = query._hydrate
                     if hydrate is None:
                         hydrate = query.hydrator(self.dialect, description)
@@ -723,8 +725,10 @@ class Engine:
             observer = self.observer
             start = perf_counter() if observer is not None else 0.0
             total = 0
-            async with acquire() as conn:
-                async for rows, description in self._stream(conn, sql, bound, wanted, query):
+            async with acquire() as conn, aclosing(
+                self._stream(conn, sql, bound, wanted, query)
+            ) as batches:
+                async for rows, description in batches:
                     hydrate = query._hydrate
                     if hydrate is None:
                         hydrate = query.hydrator(self.dialect, description)
@@ -740,20 +744,22 @@ class Engine:
 
     async def _stream(
         self, conn: Any, sql: str, bound: Any, chunk: int, query: CoreQuery[Any]
-    ) -> AsyncIterator[tuple[Any, Any]]:
+    ) -> AsyncGenerator[tuple[Any, Any], None]:
         """The driver's chunks, each fetch inside `around`: entering it once for the
         whole stream would hold it across the consumer's code at every yield.
+        Closed explicitly (`async for` would leave it to GC) so the cursor goes
+        before the connection is released.
         """
-        chunks = self.driver.stream(conn, sql, bound, chunk, query)
-        while True:
-            with self._around(sql):
-                try:
-                    batch = await anext(chunks)
-                except StopAsyncIteration:
-                    return
-                except self.driver.errors as err:
-                    raise self._wrap(err, sql, bound)
-            yield batch
+        async with aclosing(self.driver.stream(conn, sql, bound, chunk, query)) as chunks:
+            while True:
+                with self._around(sql):
+                    try:
+                        batch = await anext(chunks)
+                    except StopAsyncIteration:
+                        return
+                    except self.driver.errors as err:
+                        raise self._wrap(err, sql, bound)
+                yield batch
 
     def _observe(self, observer: Observer | None, sql: str, start: float, rows: int | None) -> None:
         """Hand one completed statement to `observer`. Captured by the caller at start,

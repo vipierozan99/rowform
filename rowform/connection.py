@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import contextvars
 from collections.abc import Sequence
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from contextlib import AbstractAsyncContextManager, aclosing, asynccontextmanager
 from time import perf_counter
 from typing import TYPE_CHECKING, Any, TypeVar, overload
 
@@ -341,8 +341,11 @@ class Connection:
         transaction and the `commit()` after it ends something.
         """
         await self._autobegin()
-        async for row in self._engine._iterate(statement, chunk, params, self._pinned):
-            yield row
+        async with aclosing(
+            self._engine._iterate(statement, chunk, params, self._pinned)
+        ) as rows:
+            async for row in rows:
+                yield row
 
     async def execute_many(self, statement: Any, params: Sequence[dict[str, Any]]) -> Any:
         """One compiled statement, many parameter sets, one round trip; the driver's own report."""

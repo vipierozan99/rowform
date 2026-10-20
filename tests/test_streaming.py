@@ -13,6 +13,8 @@ row for row and type for type, is broken however elegantly it chunks.
 
 from __future__ import annotations
 
+from contextlib import aclosing
+
 import pytest
 import sqlalchemy as sa
 from conftest import Author, Book, Wide, engine_at, pg_url, seed, sqlite_db
@@ -158,6 +160,29 @@ class TestConnectionHandling:
         async for _ in engine.fetch_iter(sa.select(Author), chunk=1):
             break
         assert await engine.fetch_all(sa.select(Author))
+
+    async def test_closing_the_iterator_closes_the_driver_cursor_first(self, engine, monkeypatch):
+        """`async for` does not close an inner generator, so without this the
+        cursor lingered until GC, after its connection was released: on sqlite it
+        kept the file's lock past the scope."""
+        driver_stream = engine.driver.stream
+        closed = []
+
+        async def spy(*args):
+            try:
+                async with aclosing(driver_stream(*args)) as inner:
+                    async for batch in inner:
+                        yield batch
+            finally:
+                closed.append(True)
+
+        monkeypatch.setattr(engine.driver, "stream", spy)
+        async with engine.connect() as conn:
+            rows = conn.fetch_iter(sa.select(Author), chunk=1)
+            async for _ in rows:
+                break
+            await rows.aclose()
+            assert closed == [True]
 
     async def test_repeated_streams_do_not_exhaust_the_pool(self, sqlite_path, seeded_sqlite):
         async with sqlite_db(sqlite_path, pool_size=1, max_overflow=1) as db:
