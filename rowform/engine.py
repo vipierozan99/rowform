@@ -719,16 +719,21 @@ class Engine:
         """`driver.fetch`, inside `around`. A statement the schema changed under, with
         no transaction open, is prepared again and run once more, as asyncpg does for
         its own cache: nothing was done, so nothing is lost. `around` sees both round
-        trips. Inside a transaction it raises, which aborted it, as Core does.
+        trips, and the first one fail. Inside a transaction it raises, which aborted it,
+        as Core does.
         """
         driver = self.driver
-        with self._around(sql):
-            try:
-                return await driver.fetch(conn, sql, bound, describe)
-            except driver.errors as err:
-                wrapped = self._wrap(err, conn, sql, bound)
-                if not driver.is_stale(err) or driver.in_transaction(conn):
-                    raise wrapped
+        retry = False
+        try:
+            with self._around(sql):
+                try:
+                    return await driver.fetch(conn, sql, bound, describe)
+                except driver.errors as err:
+                    retry = driver.is_stale(err) and not driver.in_transaction(conn)
+                    raise self._wrap(err, conn, sql, bound)
+        except DBAPIError:
+            if not retry:
+                raise
         with self._around(sql):
             try:
                 return await driver.fetch(conn, sql, bound, True)

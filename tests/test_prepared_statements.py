@@ -54,16 +54,20 @@ async def retyped(pg_dsn, pg_driver):
 
 class TestAfterTheSchemaChanged:
     async def test_a_read_outside_a_transaction_runs_again(self, retyped):
-        """Two round trips, both inside `around`, one statement for the observer."""
+        """Two round trips, both inside `around`, which sees the first one fail, and one
+        statement for the observer.
+        """
         db, migrate = retyped
         await migrate()
         trips, observed = [], []
         db.around = lambda sql: _Counted(trips)
         db.observer = lambda sql, seconds, rows: observed.append(rows)
         assert await db.fetch_all(READ) == [(1, 10)]
-        assert (len(trips), observed) == (2, [1])
+        assert observed == [1]
+        assert len(trips) == 2 and trips[1] is None
+        assert trips[0] is not None and issubclass(trips[0], sa.exc.NotSupportedError)
         assert await db.fetch_all(READ) == [(1, 10)]
-        assert len(trips) == 3
+        assert trips[2:] == [None]
 
     async def test_inside_a_transaction_it_raises_once_as_core_does(self, retyped):
         db, migrate = retyped
@@ -76,14 +80,16 @@ class TestAfterTheSchemaChanged:
 
 
 class _Counted:
+    """Records, per round trip, the exception class `__exit__` saw (None for an answer)."""
+
     def __init__(self, trips: list) -> None:
         self.trips = trips
 
     def __enter__(self) -> None:
-        self.trips.append(None)
-
-    def __exit__(self, *exc: object) -> None:
         return None
+
+    def __exit__(self, kind: type[BaseException] | None, *exc: object) -> None:
+        self.trips.append(kind)
 
 
 class TestAsyncpgSharesCoresCache:
