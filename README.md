@@ -106,7 +106,8 @@ async with db.connect() as conn:          # commit-as-you-go, like AsyncConnecti
 ```
 
 A one-shot `fetch_all`/`fetch_one` on a `SELECT` takes a pooled connection
-directly and runs outside any transaction: one snapshot, no `BEGIN`/`COMMIT`, no
+directly and runs outside any transaction: one snapshot, no `BEGIN`/`COMMIT` (on
+asyncpg, except the run that first prepares the statement on that connection), no
 isolation level. A read that needs either belongs in a scope. Calling `db.fetch_*`
 *inside* a scope raises rather than silently reading from another connection.
 
@@ -170,7 +171,7 @@ recipe, the gates and the lessons are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md
 
 ## Documentation
 
-- [docs/GUIDE.md](docs/GUIDE.md) — recipes: FastAPI, pagination, streaming, `bind=`, Alembic, testing
+- [docs/GUIDE.md](docs/GUIDE.md) — recipes: FastAPI, pagination, streaming, `bind=`, Alembic and live migrations, pgbouncer, testing
 - [docs/API.md](docs/API.md) — every public name and what it returns
 - [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — the numbers, how they are taken, what went wrong before
 - [CONTRIBUTING.md](CONTRIBUTING.md) · [SECURITY.md](SECURITY.md)

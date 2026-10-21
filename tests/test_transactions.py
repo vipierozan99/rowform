@@ -95,7 +95,7 @@ class TestVisibility:
     async def test_invisible_to_other_connections_until_commit(self, engine):
         async with engine.begin() as tx:
             await tx.execute(sa.insert(Author.__table__).values(id=50, name="x", active=True))
-            async with engine.acquire() as conn:
+            async with engine._connection() as conn:
                 rows, _ = await engine.driver.fetch(
                     conn, "SELECT count(*) FROM t_authors", (), False
                 )
