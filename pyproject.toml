@@ -48,7 +48,12 @@ classifiers = [
 # `Column._default_description_tuple`/`_onupdate_description_tuple` (Python-side
 # column defaults, pinned by `tests/test_engines.py::TestColumnDefaults`),
 # `util.await_only`, and the asyncpg adapter's `_started`/`_start_transaction`
-# and `_asyncpg_error_translate` (pinned by `tests/test_driver_errors.py`).
+# and `_asyncpg_error_translate` (pinned by `tests/test_driver_errors.py`), its
+# prepared-statement cache — `_prepare`, `_prepared_statement_cache` and its
+# `(statement, attributes, prepared at)` entries, `_check_type_cache_invalidation`
+# — and the dialect's `_invalidate_schema_cache`/`_invalidate_schema_cache_asof`
+# (pinned by `tests/test_prepared_statements.py::TestPrivateAPI`, which also pins
+# the one driver-private read, psycopg's `_prepared.clear()`).
 # Those are the compiler and result internals — none of them carry a
 # compatibility promise across a minor release, and a caller resolving to 2.1
 # would find out at runtime rather than at install. Raise it deliberately, with

@@ -1,7 +1,8 @@
 """What differs between drivers once SQLAlchemy owns the pool and the transaction:
-running a string for rows and a description, streaming, COPY, pipeline mode.
+running a string for rows and a description, streaming, COPY, pipeline mode, and
+recovering from a statement prepared before the schema changed.
 
-Nothing here opens a connection; each method takes the driver connection
+Nothing here opens a connection; each method takes `native()` of the connection
 SQLAlchemy checked out, and the dialect is the wrapping engine's own.
 """
 
@@ -34,6 +35,33 @@ class Driver(ABC):
 
     def __init__(self, dialect: Any):
         self.dialect = dialect
+
+    def native(self, dbapi_connection: Any) -> Any:
+        """What this driver's methods take, given SQLAlchemy's adapted DBAPI connection:
+        the driver connection under it, except where the adapter is needed (asyncpg).
+        """
+        return dbapi_connection.driver_connection
+
+    def is_stale(self, err: Exception) -> bool:
+        """Whether `err` is postgres refusing a statement prepared before the schema
+        changed under it, the errors Core's asyncpg dialect invalidates its caches on.
+        Default: never; sqlite prepares again by itself.
+        """
+        return False
+
+    def invalidate(self, conn: Any) -> None:
+        """Forget what was prepared against the old schema, after `is_stale`."""
+
+    def in_transaction(self, conn: Any) -> bool:
+        """Whether a statement that failed on `conn` failed inside a transaction, which
+        it aborted, so that it cannot simply run again.
+        """
+        return True
+
+    @staticmethod
+    def type_codes(description: Any) -> list[Any]:
+        """The DBAPI type code of each column `fetch`/`stream` described."""
+        return [column[1] for column in description]
 
     async def enter_transaction(self, sa_conn: Any) -> None:
         """Put the driver connection inside the transaction SQLAlchemy opened on
@@ -72,8 +100,9 @@ class Driver(ABC):
     async def fetch(
         self, conn: Any, sql: str, params: Any, describe: bool
     ) -> tuple[Any, Any]:
-        """Run `sql` and return `(rows, description)`; `description` is
-        `cursor.description`-shaped and only consulted when `describe` is true.
+        """Run `sql` and return `(rows, description)`, for `type_codes`. `description`
+        may be None unless `describe` is true; a driver whose server can change a
+        column's type under a cached statement returns one every time.
         """
 
     @abstractmethod
@@ -166,9 +195,56 @@ class SqliteDriver(Driver):
 
 
 class AsyncpgDriver(Driver):
-    """asyncpg. JSON codecs are registered by SQLAlchemy's dialect `on_connect`."""
+    """asyncpg. JSON codecs are registered by SQLAlchemy's dialect `on_connect`.
+
+    Statements are prepared by SQLAlchemy's adapter, through the per-connection cache
+    Core's cursor uses (`_prepare`, SQLAlchemy-private): `prepared_statement_cache_size`
+    and `prepared_statement_name_func` apply to them, and so does the dialect-wide
+    invalidation Core starts after DDL or a stale statement. asyncpg's own cache,
+    sized by `statement_cache_size`, serves only `executemany` and introspection, as
+    under Core.
+    """
 
     defers_transaction = True
+
+    def native(self, dbapi_connection):
+        return dbapi_connection
+
+    async def _prepare(self, conn: Any, sql: str) -> tuple[Any, Any]:
+        """`(prepared statement, attributes)`, as Core's cursor gets them."""
+        return await conn._prepare(sql, self.dialect._invalidate_schema_cache_asof)
+
+    def _cached(self, conn: Any, sql: str) -> tuple[Any, Any] | None:
+        """What `_prepare` would answer without preparing, or None: its cache entry is
+        `(statement, attributes, prepared at)`, current if prepared after the last
+        invalidation. Also SQLAlchemy-private.
+        """
+        cache = conn._prepared_statement_cache
+        entry = cache.get(sql) if cache is not None else None
+        if entry is not None and entry[2] > self.dialect._invalidate_schema_cache_asof:
+            return entry[0], entry[1]
+        return None
+
+    @cached_property
+    def _stale(self) -> tuple[type[Exception], ...]:
+        exceptions = self.dialect.loaded_dbapi.asyncpg.exceptions
+        return (exceptions.InvalidCachedStatementError, exceptions.InternalServerError)
+
+    def is_stale(self, err):
+        return isinstance(err, self._stale)
+
+    def invalidate(self, conn):
+        """What Core's execution context does on the same errors: every connection's
+        cached statements and asyncpg type caches are rebuilt before their next use.
+        """
+        self.dialect._invalidate_schema_cache()
+
+    def in_transaction(self, conn):
+        return conn.driver_connection.is_in_transaction()
+
+    @staticmethod
+    def type_codes(description):
+        return [attribute.type.oid for attribute in description]
 
     async def enter_transaction(self, sa_conn):
         """Start the asyncpg transaction SQLAlchemy's `begin()` only promised.
@@ -200,30 +276,36 @@ class AsyncpgDriver(Driver):
         raise AssertionError(f"{type(err)} is not in the asyncpg error map") from err
 
     async def fetch(self, conn, sql, params, describe):
-        if not describe:
-            return await conn.fetch(sql, *params), None
-        # No cursor, so no `description`: the type OIDs live on the prepared statement.
-        prepared = await conn.prepare(sql)
-        rows = await prepared.fetch(*params)
-        description = [(a.name, a.type.oid) for a in prepared.get_attributes()]
-        return rows, description
+        """The description is the attributes cached with the statement, so it is free.
+
+        A statement that has to be prepared outside a transaction is prepared and run
+        inside one, as Core always does: behind a transaction pooler, a type lookup
+        asyncpg makes between the two hands the client a different server, which never
+        saw the statement. A cached one runs as it is, in one round trip.
+        """
+        cached = self._cached(conn, sql)
+        if cached is None and not conn.driver_connection.is_in_transaction():
+            async with conn.driver_connection.transaction():
+                prepared, attributes = await self._prepare(conn, sql)
+                return await prepared.fetch(*params), attributes
+        prepared, attributes = cached or await self._prepare(conn, sql)
+        return await prepared.fetch(*params), attributes
 
     async def stream(self, conn, sql, params, chunk, query):
         """A portal over the prepared statement; asyncpg needs a transaction for one."""
-        async with conn.transaction():
-            prepared = await conn.prepare(sql)
-            description = [(a.name, a.type.oid) for a in prepared.get_attributes()]
+        async with conn.driver_connection.transaction():
+            prepared, attributes = await self._prepare(conn, sql)
             cursor = await prepared.cursor(*params)
             while True:
                 rows = await cursor.fetch(chunk)
                 if not rows:
                     return
-                yield rows, description
+                yield rows, attributes
 
     async def copy_in(self, conn, table, columns, records):
         """asyncpg's binary COPY; it encodes values with the same codecs a query would."""
         # `schema=None` stays unqualified so `search_path` resolves it, as psycopg's does.
-        await conn.copy_records_to_table(
+        await conn.driver_connection.copy_records_to_table(
             table.name,
             records=records,
             columns=list(columns),
@@ -232,12 +314,21 @@ class AsyncpgDriver(Driver):
         return len(records)
 
     async def execute(self, conn, sql, params):
-        """Returns asyncpg's status tag (`"INSERT 0 3"`), the driver's own report."""
-        return await conn.execute(sql, *(params or ()))
+        """Returns asyncpg's status tag (`"INSERT 0 3"`), the driver's own report. With no
+        parameters it is one simple-protocol round trip and nothing is prepared.
+        """
+        if not params:
+            return await conn.driver_connection.execute(sql)
+        prepared, _ = await self._prepare(conn, sql)
+        await prepared.fetch(*params)
+        return prepared.get_statusmsg()
 
     async def execute_many(self, conn, sql, params):
-        """asyncpg's `executemany` reports nothing, so `Result.rowcount` is `-1` here."""
-        return await conn.executemany(sql, params)
+        """asyncpg's `executemany` reports nothing, so `Result.rowcount` is `-1` here.
+        Its statement is asyncpg's to cache, as under Core, after the same invalidation check.
+        """
+        await conn._check_type_cache_invalidation(self.dialect._invalidate_schema_cache_asof)
+        return await conn.driver_connection.executemany(sql, params)
 
 
 class PsycopgDriver(Driver):
@@ -270,10 +361,40 @@ class PsycopgDriver(Driver):
                 # it, and lets the CancelledError through rather than a ProgrammingError.
                 await conn.close()
 
+    def is_stale(self, err: Any) -> bool:
+        """The two errors asyncpg classifies as `InvalidCachedStatementError` and
+        `InternalServerError`, by SQLSTATE.
+        """
+        state = getattr(err, "sqlstate", None)
+        return state == "XX000" or (
+            state == "0A000"
+            and err.diag.message_primary == "cached plan must not change result type"
+        )
+
+    def invalidate(self, conn):
+        """What the `ROLLBACK` ending a transaction does: psycopg forgets its prepared
+        statements and deallocates them with its next one. A one-shot read in
+        autocommit never rolls back, so without this a statement prepared before a
+        type change fails on that connection for good. `_prepared` is psycopg-private.
+        """
+        conn._prepared.clear()
+
+    def in_transaction(self, conn):
+        from psycopg.pq import TransactionStatus
+
+        return conn.info.transaction_status != TransactionStatus.IDLE
+
+    @staticmethod
+    def type_codes(description):
+        return description
+
     async def fetch(self, conn, sql, params, describe):
+        """The description is the result's type OIDs: `cursor.description` builds a
+        `Column` per field, which costs far more and holds nothing else needed.
+        """
         cursor = await conn.execute(sql, params)
         rows = await cursor.fetchall()
-        return rows, cursor.description if describe else None
+        return rows, _type_oids(cursor)
 
     async def stream(self, conn, sql, params, chunk, query):
         """A named (server-side) cursor; the unnamed one reads every row into the client
@@ -288,12 +409,11 @@ class PsycopgDriver(Driver):
             )
         async with conn.cursor(name=f"rowform_stream_{next(_STREAM_NAMES)}") as cursor:
             await cursor.execute(sql, params)
-            description = cursor.description
             while True:
                 rows = await cursor.fetchmany(chunk)
                 if not rows:
                     return
-                yield rows, description
+                yield rows, _type_oids(cursor)
 
     async def copy_in(self, conn, table, columns, records):
         """`COPY ... FROM STDIN`; identifiers quoted by SQLAlchemy's own preparer."""
@@ -326,6 +446,11 @@ class PsycopgDriver(Driver):
                 "this psycopg build has no pipeline mode; it needs libpq 14 or newer"
             )
         return conn.pipeline()
+
+
+def _type_oids(cursor: Any) -> list[int]:
+    result = cursor.pgresult
+    return [result.ftype(i) for i in range(result.nfields)]
 
 
 #: Keyed by `dialect.driver`, the name after the `+` in the URL.
